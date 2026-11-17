@@ -439,7 +439,9 @@ class UnstructuredPoloidalGrid:
         else:
             # Nodes on a wall can keep sliding slowly along it; an offset this
             # small is negligible next to the O(h^2) truncation error.
-            final = np.max(np.abs(self.dual_centroid_offsets()) / self.h)
+            final_delta = self.dual_centroid_offsets()
+            final_delta[wall] = 0.0  # wall-normal offsets are inherent
+            final = np.max(np.abs(final_delta) / self.h)
             if final > 10 * tol:
                 warnings.warn(
                     f"centroidal_relax: offset {final:.2g}*h after {max_iter} iterations"
