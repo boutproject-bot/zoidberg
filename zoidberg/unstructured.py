@@ -1043,6 +1043,16 @@ def _plane_dagp(
     """
     from scipy.sparse import csr_matrix
 
+    # Small meshes (e.g. the 1D test grids) cannot provide the full stencil;
+    # use as many nodes as there are
+    max_extra = pol.n_nodes - num_coefs(order)
+    if extra > max_extra:
+        warnings.warn(
+            f"Perpendicular-operator stencils reduced to {pol.n_nodes} nodes "
+            f"(mesh too small for num_coefs({order}) + {extra})"
+        )
+        extra = max(max_extra, 0)
+
     saved_h = pol.h.copy()
     if isotropic:
         pol.h = np.full(2, np.sqrt(saved_h[0] * saved_h[1]))
