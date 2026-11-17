@@ -58,12 +58,14 @@ Perpendicular diffusion (poloidal-plane form)
     midpoint, and the wall itself is zero-flux.
 
 Metric (Slab geometry only)
-    ``dx = dual-cell area``, ``dy = Ly/ny``, ``dz = 1``. ``g11 = g33 = 1``,
+    ``dx = dz = 1`` (Coordinates requires uniform dx, dz for FCI; the
+    dual-cell areas are in ``dagp_us_volume``), ``dy = Ly/ny``. ``g11 = g33 = 1``,
     ``g13 = g12 = g23 = 0`` and the matching covariant components.
     ``g_22 = (|B|/B_y)^2`` and ``g22 = 1/g_22``; ``Bxy = |B|``.
     ``d2x = d2y = d2z = 0``. Parallel slices ``forward_*``/``backward_*`` of
     ``g_11, g_22, g_33, g_13, g11, g22, g33, g13, dy, Bxy`` are evaluated at
-    the traced end points.
+    the traced end points. ``By``, ``By_cell_ylow/yhigh`` and
+    ``g_22_cell_ylow/yhigh`` (half-step positions) as for structured slabs.
 """
 
 from __future__ import annotations
@@ -717,7 +719,8 @@ def trace_maps(grid, field, rtol=1e-10, field_tracer=None):
 
     Returns a dict with per-plane arrays of shape ``(ny, n_nodes)``:
     ``forward_R``, ``forward_Z``, ``forward_hit`` (0 inside, -1 inner wall,
-    +1 outer wall), and the same for ``backward``.
+    +1 outer wall), ``forward_half_R``/``forward_half_Z`` (positions half
+    way to the next plane), and the same for ``backward``.
     """
     tracer = field_tracer or fieldtracer.FieldTracer(field)
     ny, n = grid.ny, grid.n_nodes
@@ -726,14 +729,20 @@ def trace_maps(grid, field, rtol=1e-10, field_tracer=None):
     for name, sign in (("forward", +1), ("backward", -1)):
         Rp = np.zeros((ny, n))
         Zp = np.zeros((ny, n))
+        Rh = np.zeros((ny, n))
+        Zh = np.zeros((ny, n))
         hit = np.zeros((ny, n), dtype=int)
         for j in range(ny):
             pol = grid.plane(j)
             y0 = grid.ycoords[j]
             y1 = y0 + sign * dy[j]
-            end = np.array(
-                tracer.follow_field_lines(pol.R, pol.Z, [y0, y1], rtol=rtol)
-            )[-1]
+            traced = np.array(
+                tracer.follow_field_lines(
+                    pol.R, pol.Z, [y0, y0 + 0.5 * sign * dy[j], y1], rtol=rtol
+                )
+            )
+            Rh[j], Zh[j] = traced[1, :, 0], traced[1, :, 1]
+            end = traced[-1]
             jn = j + sign
             if not grid.yperiodic and (jn < 0 or jn >= ny):
                 # Past the end of a non-periodic domain
@@ -752,6 +761,8 @@ def trace_maps(grid, field, rtol=1e-10, field_tracer=None):
             hit[last] = +1
         out[f"{name}_R"] = Rp
         out[f"{name}_Z"] = Zp
+        out[f"{name}_half_R"] = Rh
+        out[f"{name}_half_Z"] = Zh
         out[f"{name}_hit"] = hit
     return out
 
@@ -1011,7 +1022,28 @@ def slab_metric(grid, field, maps, volume):
         "d2y": zeros.copy(),
         "d2z": zeros.copy(),
     }
-    metric["dx"] = grid.to3d(volume)  # so that J*dx*dy*dz is the cell volume
+    # dx and dz must be uniform (Coordinates asserts this for FCI). The
+    # parallel finite-volume operators only use ratios of cell areas and
+    # volumes, in which dx*dz cancels; the dual-cell areas are in
+    # dagp_us_volume.
+    metric["dx"] = ones.copy()
+    metric["By"] = grid.to3d(By)
+
+    # Staggered (half-step) quantities, as written by zoidberg.make_maps
+    for name, post, sign in (
+        ("forward", "_cell_yhigh", +1),
+        ("backward", "_cell_ylow", -1),
+    ):
+        Bh = np.zeros((ny, n))
+        Byh = np.zeros((ny, n))
+        for j in range(ny):
+            Bh[j], Byh[j] = bfield(
+                maps[f"{name}_half_R"][j],
+                maps[f"{name}_half_Z"][j],
+                grid.ycoords[j] + 0.5 * sign * dy[j],
+            )
+        metric[f"By{post}"] = grid.to3d(Byh)
+        metric[f"g_22{post}"] = grid.to3d((Bh / Byh) ** 2)
 
     for name, sign in (("forward", +1), ("backward", -1)):
         Bm = np.zeros((ny, n))

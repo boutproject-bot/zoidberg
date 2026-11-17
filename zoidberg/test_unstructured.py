@@ -215,6 +215,11 @@ def test_contract_variables_finite(tmp_path):
         "forward_g_22",
         "backward_Bxy",
         "forward_dy",
+        "By",
+        "By_cell_ylow",
+        "By_cell_yhigh",
+        "g_22_cell_ylow",
+        "g_22_cell_yhigh",
     ]
     for name in required:
         assert name in data, name
