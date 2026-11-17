@@ -75,15 +75,19 @@ Perpendicular diffusion (poloidal-plane form)
     triangles; at a boundary edge the face runs from the centroid to the edge
     midpoint, and the wall itself is zero-flux.
 
-Metric (Slab geometry only)
+Metric
     ``dx = dz = 1`` (Coordinates requires uniform dx, dz for FCI; the
     dual-cell areas are in ``dagp_us_volume``), ``dy = Ly/ny``. ``g11 = g33 = 1``,
     ``g13 = g12 = g23 = 0`` and the matching covariant components.
-    ``g_22 = (|B|/B_y)^2`` and ``g22 = 1/g_22``; ``Bxy = |B|``.
+    ``g_22 = (|B|/B_y)^2`` for Cartesian (Slab-type) fields and
+    ``(R |B|/B_y)^2`` for cylindrical ones (y the toroidal angle), as in
+    zoidberg's structured metric; ``g22 = 1/g_22``; ``Bxy = |B|``.
     ``d2x = d2y = d2z = 0``. Parallel slices ``forward_*``/``backward_*`` of
     ``g_11, g_22, g_33, g_13, g11, g22, g33, g13, dy, Bxy`` are evaluated at
     the traced end points. ``By``, ``By_cell_ylow/yhigh`` and
-    ``g_22_cell_ylow/yhigh`` (half-step positions) as for structured slabs.
+    ``g_22_cell_ylow/yhigh`` (half-step positions) as for structured grids.
+    For cylindrical fields the perpendicular operator weights volumes and
+    fluxes by R.
 """
 
 from __future__ import annotations
@@ -486,8 +490,9 @@ class UnstructuredPoloidalGrid:
         if not (np.all(cross > 0) or np.all(cross < 0)):
             raise ValueError("Triangulation became tangled")
 
-    def dual_volumes(self):
-        """Area of each node's centroid-dual cell.
+    def dual_volumes(self, cylindrical=False):
+        """Area of each node's centroid-dual cell (``cylindrical``: the
+        integral of R over it, i.e. the volume per radian of toroidal angle).
 
         Each face contributes the signed area of the triangle (node, start,
         end). Wall segments pass through the node itself and contribute
@@ -498,11 +503,16 @@ class UnstructuredPoloidalGrid:
         s, e = f["start"], f["end"]
         # relative to node i
         area_i = 0.5 * (s[:, 0] * e[:, 1] - s[:, 1] * e[:, 0])
+        if cylindrical:
+            # Exact integral of R over the triangle (node, start, end)
+            area_i = area_i * (self.R[f["i"]] + (s[:, 0] + e[:, 0]) / 3.0)
         np.add.at(vol, f["i"], area_i)
         # relative to node j: positions shifted by -xj_rel, traversal reversed
         xj_rel = self.minimum_image(self.points[f["j"]] - self.points[f["i"]])
         sj, ej = s - xj_rel, e - xj_rel
         area_j = -0.5 * (sj[:, 0] * ej[:, 1] - sj[:, 1] * ej[:, 0])
+        if cylindrical:
+            area_j = area_j * (self.R[f["j"]] + (sj[:, 0] + ej[:, 0]) / 3.0)
         np.add.at(vol, f["j"], area_j)
         if np.any(vol <= 0):
             raise ValueError("Non-positive dual volume; triangulation is not valid")
@@ -996,6 +1006,7 @@ def _plane_dagp(
     isotropic=True,
     max_stabilisation=8.0,
     stability_tol=1e-10,
+    cylindrical=False,
 ):
     """Per-plane CSR blocks (local node / face-point numbering).
 
@@ -1022,6 +1033,9 @@ def _plane_dagp(
     Distance weighting (``weight_power``) was tested and makes stability
     worse; it is off by default.
 
+    With ``cylindrical=True`` (fields with a major radius) volumes and face
+    fluxes are weighted by R, giving (1/R) d/dR (R a df/dR) + d/dZ (a df/dZ).
+
     With ``isotropic=True`` (default) the least-squares fits use physical
     distances. Scaling R and Z separately by the node spacings (as for the
     parallel maps) amplifies errors on strongly anisotropic meshes, where
@@ -1035,7 +1049,7 @@ def _plane_dagp(
         pol._kdtree = None
     try:
         f = pol.faces()
-        vol = pol.dual_volumes()
+        vol = pol.dual_volumes(cylindrical=cylindrical)
         tq, wq = _FACE_RULES[rule]
         nq = len(tq)
         n_faces = len(f["i"])
@@ -1056,6 +1070,8 @@ def _plane_dagp(
         }
         inds, w_val, w_dR, w_dZ, info = pol.lsq_weights(pol.wrap(fp), **lsq)
         nvec = np.repeat(normal, nq, axis=0) * np.tile(wq, n_faces)[:, None]
+        if cylindrical:
+            nvec = nvec * pol.wrap(fp)[:, :1]  # R at each face point
         w_grad = nvec[:, :1] * w_dR + nvec[:, 1:] * w_dZ
         fi = np.repeat(f["i"], nq)
         fj = np.repeat(f["j"], nq)
@@ -1074,6 +1090,8 @@ def _plane_dagp(
             m_inds, m_val, m_dR, m_dZ, m_info = pol.lsq_weights(mid, **lsq)
             fallback += m_info["fallback"]
             c = np.sum(normal**2, axis=1) / np.sum(edge * normal, axis=1)
+            if cylindrical:
+                c = c * mid[:, 0]
             m_grad = -c[:, None] * (edge[:, :1] * m_dR + edge[:, 1:] * m_dZ)
             # Append the two-point difference as two extra columns
             k = max(inds.shape[1], m_inds.shape[1]) + 2
@@ -1294,16 +1312,31 @@ def dagp_unstructured(
 # Metric
 
 
+def is_cylindrical(field):
+    """True for fields in cylindrical coordinates (y is the toroidal angle)."""
+    return field.Rfunc(np.ones(1), np.zeros(1), 0.0) is not None
+
+
 def slab_metric(grid, field, maps, volume):
-    """Metric for Cartesian (Slab-type) fields; see the module docstring."""
-    if field.Rfunc(np.zeros(1), np.zeros(1), 0.0) is not None:
-        raise NotImplementedError("Only Cartesian (Slab-type) fields are supported")
+    """Metric; see the module docstring.
+
+    Cartesian fields (Slab type): ``g_22 = (|B|/B_y)^2``. Cylindrical fields
+    (``Rfunc`` gives the major radius, y is the toroidal angle):
+    ``g_22 = (R |B|/B_y)^2``, as in :func:`zoidberg.zoidberg.get_metric`.
+    """
     ny, n = grid.ny, grid.n_nodes
     shape = grid.shape
     dy = grid.dy()
 
+    cylindrical = is_cylindrical(field)
+
     def bfield(R, Z, y):
-        return field.Bmag(R, Z, y), field.Byfunc(R, Z, y)
+        """|B| and B_y, with B_y divided by the major radius if cylindrical,
+        so that (|B|/B_y)^2 is g_22."""
+        By = field.Byfunc(R, Z, y)
+        if cylindrical:
+            By = By / field.Rfunc(R, Z, y)
+        return field.Bmag(R, Z, y), By
 
     Bmag = np.zeros((ny, n))
     By = np.zeros((ny, n))
@@ -1340,7 +1373,9 @@ def slab_metric(grid, field, maps, volume):
     # volumes, in which dx*dz cancels; the dual-cell areas are in
     # dagp_us_volume.
     metric["dx"] = ones.copy()
-    metric["By"] = grid.to3d(By)
+    metric["By"] = grid.to3d(
+        By * (np.array([grid.plane(j).R for j in range(ny)]) if cylindrical else 1.0)
+    )
 
     # Staggered (half-step) quantities, as written by zoidberg.make_maps
     for name, post, sign in (
@@ -1355,6 +1390,8 @@ def slab_metric(grid, field, maps, volume):
                 maps[f"{name}_half_Z"][j],
                 grid.ycoords[j] + 0.5 * sign * dy[j],
             )
+        if cylindrical:
+            Byh = Byh * maps[f"{name}_half_R"]
         metric[f"By{post}"] = grid.to3d(Byh)
         metric[f"g_22{post}"] = grid.to3d((Bh / Byh) ** 2)
 
@@ -1413,6 +1450,7 @@ def build_grid_data(
         order=dagp_order,
         rule=rule,
         strict=strict,
+        cylindrical=is_cylindrical(field),
     )
     volume = np.array([grid.plane(j).dual_volumes() for j in range(grid.ny)])
     data = {}
@@ -1517,12 +1555,46 @@ BOUT_MMS = {
 }
 
 
+# Cylindrical test grids: pure toroidal field (Screwpinch without shear) on
+# an annulus R in [1, 2] with Dirichlet walls, periodic in Z (Lz = 1).
+BOUT_MMS_CYL = {"R0": 1.0, "Lx": 1.0, "Lz": 1.0, "ny": 4, "jitter": 0.2, "seed": 4321}
+
+
 def make_test_grid(family, n, filename=None, **kwargs):
     """Shared entry point for test grids (used by BOUT-dev and Hermes-3).
 
-    Currently provides ``family = "bout_mms"``; other families are built by
-    the callers with :func:`make_unstructured_grid`.
+    Families: ``"bout_mms"`` (MMS-spatial-fci-unstructured, Slab field) and
+    ``"bout_mms_cyl"`` (cylindrical case of that test). Other families are
+    built by the callers with :func:`make_unstructured_grid`.
     """
+    if family == "bout_mms_cyl":
+        from .field import Screwpinch
+
+        p = dict(BOUT_MMS_CYL, **kwargs)
+        pol = UnstructuredPoloidalGrid.slab(
+            n + 1,
+            n,
+            p["Lx"],
+            p["Lz"],
+            R0=p["R0"],
+            Z0=0.0,
+            jitter=p["jitter"],
+            jitter_dirs="rz",
+            periodic_R=False,
+            periodic_Z=True,
+            seed=p["seed"] + n,
+            r_on_walls=True,
+        )
+        field = Screwpinch(xcentre=p["R0"] + 0.5 * p["Lx"], shear=0.0, Btor=1.0)
+        return make_unstructured_grid(
+            filename,
+            pol,
+            field,
+            ny=p["ny"],
+            Ly=2.0 * np.pi,
+            yperiodic=True,
+            dirichlet_walls=True,
+        )
     if family != "bout_mms":
         raise ValueError(f"Unknown test-grid family '{family}'")
     p = dict(BOUT_MMS, **kwargs)
@@ -1547,11 +1619,13 @@ def make_test_grid(family, n, filename=None, **kwargs):
 
 __all__ = [
     "BOUT_MMS",
+    "BOUT_MMS_CYL",
     "StencilFallbackWarning",
     "UnstructuredGrid",
     "UnstructuredPoloidalGrid",
     "build_grid_data",
     "dagp_unstructured",
+    "is_cylindrical",
     "make_test_grid",
     "make_unstructured_grid",
     "num_coefs",

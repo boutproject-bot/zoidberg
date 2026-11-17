@@ -400,3 +400,70 @@ def test_dagp_flows_and_conservation():
     rows = np.flatnonzero((abs(L) @ outside == 0) & (abs(Rt) @ outside == 0))
     assert len(rows) > 0
     assert np.allclose((L @ alin)[rows], (Rt @ alin)[rows], atol=1e-9)
+
+
+def test_cylindrical_operator_and_metric():
+    # Pure toroidal field B = 1/R (field lines at constant R, Z): the metric
+    # is g_22 = R^2 and the perpendicular operator is the cylindrical one,
+    # (1/R) d/dR (R a df/dR) + a d2f/dZ2, second order on evolving nodes
+    from scipy.sparse import csr_matrix
+
+    field = zbfield.Screwpinch(xcentre=1.5, shear=0.0, Btor=1.0)
+    errs = []
+    for n in (12, 24):
+        pol = us.UnstructuredPoloidalGrid.slab(
+            n + 1,
+            n,
+            1.0,
+            1.0,
+            R0=1.0,
+            jitter=0.2,
+            jitter_dirs="rz",
+            periodic_R=False,
+            periodic_Z=True,
+            seed=11 + n,
+            r_on_walls=True,
+        )
+        grid = us.UnstructuredGrid(
+            pol,
+            np.linspace(0, 2 * np.pi, 4, endpoint=False),
+            2 * np.pi,
+            dirichlet_walls=True,
+        )
+        data, stats = us.build_grid_data(grid, field)
+        assert stats["dagp"]["max_re"] <= 1e-10
+        R3 = data["R"]
+        assert np.allclose(data["g_22"], R3**2)
+        assert np.allclose(data["forward_g_22"], data["forward_R"] ** 2)
+        nc, nfp = data["total_cells"], data["dagp_us_n_facepoints"]
+
+        def mat(name, shape, data=data):
+            return csr_matrix(
+                (
+                    data[f"dagp_us_{name}_weights"],
+                    data[f"dagp_us_{name}_columns"],
+                    data[f"dagp_us_{name}_rows"],
+                ),
+                shape=shape,
+            )
+
+        G, V, D = (
+            mat("gradp", (nfp, nc)),
+            mat("value", (nfp, nc)),
+            mat("div", (nc, nfp)),
+        )
+        cells = data["cell_number"][grid.node_x, 0, 0]
+        k = 2 * np.pi
+        R, Z = pol.R, pol.Z
+        fv = np.sin(k * R) * np.cos(k * Z)
+        av = 1.0 + 0.3 * np.cos(k * R)
+        f, a = np.zeros(nc), np.zeros(nc)
+        f[cells], a[cells] = fv, av
+        res = (D @ ((V @ a) * (G @ f)))[cells]
+        fR = k * np.cos(k * R) * np.cos(k * Z)
+        fRR = -k * k * fv
+        aR = -0.3 * k * np.sin(k * R)
+        ex = (a[cells] * fR) / R + aR * fR + av * fRR - av * k * k * fv
+        e = (res - ex)[grid.interior]
+        errs.append(np.sqrt(np.mean(e**2)))
+    assert np.log2(errs[0] / errs[1]) > 1.8, errs
