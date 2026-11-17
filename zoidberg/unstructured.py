@@ -909,7 +909,7 @@ def _plane_dagp(
     strict=True,
     stabilisation=1.0,
     weight_power=0.0,
-    extra=24,
+    extra=16,
     isotropic=True,
     max_stabilisation=8.0,
     stability_tol=1e-10,
@@ -930,7 +930,8 @@ def _plane_dagp(
     ``max_stabilisation``) until the operator with a = 1 has no eigenvalue
     with real part above ``stability_tol`` times its norm.
 
-    The fits use ``num_coefs(order) + extra`` nodes (default ``extra = 24``).
+    The fits use ``num_coefs(order) + extra`` nodes (default ``extra = 16``;
+    order 4 is the default from :func:`build_grid_data`).
     Compared with the minimal stencils of the parallel maps, the larger
     stencils cut the coarse-grid error on anisotropic meshes by more than 10x
     and remove the remaining growing modes. Larger ``beta`` alone does not
@@ -1244,7 +1245,7 @@ def slab_metric(grid, field, maps, volume):
 
 
 def build_grid_data(
-    grid, field, map_order=4, dagp_order=3, rule="gauss2", strict=True, rtol=1e-10
+    grid, field, map_order=4, dagp_order=4, rule="gauss2", strict=True, rtol=1e-10
 ):
     """Compute every variable of the grid-file contract. Returns
     ``(data, stats)``.
@@ -1254,7 +1255,9 @@ def build_grid_data(
     derivatives; on irregular meshes its O(h^4) error is still
     pre-asymptotic at typical resolutions, so order 4 is the default.
     ``dagp_order`` is the order of the face gradient/value fits of the
-    perpendicular operator.
+    perpendicular operator (order 4 with the larger stencils of
+    :func:`_plane_dagp` gives robust second order and no growing modes on
+    the test grids).
     """
     maps = trace_maps(grid, field, rtol=rtol)
     som, som_stats = som_weights(grid, maps, order=map_order, strict=strict)
@@ -1324,7 +1327,7 @@ def make_unstructured_grid(
     yperiodic=True,
     walls_y=False,
     map_order=4,
-    dagp_order=3,
+    dagp_order=4,
     rule="gauss2",
     strict=True,
     multiple_of=4,
