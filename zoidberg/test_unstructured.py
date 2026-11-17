@@ -175,6 +175,8 @@ def test_bout_mms_grids_no_fallback():
             _grid, _data, stats = us.make_test_grid("bout_mms", n, filename=None)
         assert stats["som"]["fallback"] == 0
         assert stats["dagp"]["fallback"] == 0
+        # No growing modes, even on the coarse, strongly anisotropic grids
+        assert stats["dagp"]["max_re"] <= 1e-10
         assert stats["forward_hits"] == 0 and stats["backward_hits"] == 0
 
 

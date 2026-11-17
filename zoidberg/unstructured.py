@@ -530,6 +530,7 @@ class UnstructuredPoloidalGrid:
         snap_tol=1e-10,
         max_cond=1e8,
         strict=False,
+        weight_power=0.0,
     ):
         """Least-squares value (and gradient) weights at target points.
 
@@ -571,6 +572,13 @@ class UnstructuredPoloidalGrid:
                 break
             u, v = u_all[todo, :kk], v_all[todo, :kk]
             V = _monomials(u, v, p)  # (mt, kk, nc)
+            if weight_power:
+                # Weighted least squares: w = (r0 / r)^weight_power, with r the
+                # scaled distance and r0 the distance of the closest point
+                r = np.sqrt(u**2 + v**2)
+                r0 = np.maximum(r.min(axis=1, keepdims=True), 1e-12)
+                sw = np.sqrt((r0 / np.maximum(r, r0)) ** weight_power)
+                V = V * sw[..., None]
             sv = np.linalg.svd(V, compute_uv=False)
             cond = sv[:, 0] / np.maximum(sv[:, -1], 1e-300)
             last = attempt == len(attempts) - 1
@@ -583,6 +591,8 @@ class UnstructuredPoloidalGrid:
                 )
             idx = todo[good]
             P = np.linalg.pinv(V[good])  # (mg, nc, kk)
+            if weight_power:
+                P = P * sw[good][:, None, :]
             inds[idx] = inds_all[idx]
             w_val[idx, :kk] = P[:, 0, :]
             w_dR[idx, :kk] = P[:, 1, :] / self.h[0]
@@ -874,7 +884,36 @@ def som_weights(grid, maps, order=4, strict=True, snap_tol=1e-10):
 # Perpendicular diffusion operator (poloidal-plane form)
 
 
-def _plane_dagp(pol, order=3, rule="gauss2", strict=True, stabilisation=1.0):
+def _max_real_eigenvalue(L, dense_limit=4096):
+    """Largest real part of the eigenvalues of the sparse matrix ``L``,
+    relative to its infinity norm. Dense for small matrices, ARPACK
+    otherwise."""
+    from scipy.sparse.linalg import ArpackNoConvergence, eigs
+
+    scale = abs(L).sum(axis=1).max()
+    n = L.shape[0]
+    if n <= dense_limit:
+        ev = np.linalg.eigvals(L.toarray())
+    else:
+        try:
+            ev = eigs(L, k=6, which="LR", return_eigenvectors=False, maxiter=20 * n)
+        except ArpackNoConvergence as err:
+            ev = err.eigenvalues
+    return float(np.max(ev.real)) / scale
+
+
+def _plane_dagp(
+    pol,
+    order=3,
+    rule="gauss2",
+    strict=True,
+    stabilisation=1.0,
+    weight_power=0.0,
+    extra=24,
+    isotropic=True,
+    max_stabilisation=8.0,
+    stability_tol=1e-10,
+):
     """Per-plane CSR blocks (local node / face-point numbering).
 
     Each face contributes ``nq`` quadrature points, where the flux is
@@ -887,58 +926,114 @@ def _plane_dagp(pol, order=3, rule="gauss2", strict=True, stabilisation=1.0):
     f, so accuracy is unchanged, but the compact difference damps
     grid-scale modes. Without it the operator has eigenvalues with positive
     real part on irregular meshes, so explicit or implicit time stepping
-    diverges.
+    diverges. Starting from ``beta = stabilisation``, beta is doubled (up to
+    ``max_stabilisation``) until the operator with a = 1 has no eigenvalue
+    with real part above ``stability_tol`` times its norm.
+
+    The fits use ``num_coefs(order) + extra`` nodes (default ``extra = 24``).
+    Compared with the minimal stencils of the parallel maps, the larger
+    stencils cut the coarse-grid error on anisotropic meshes by more than 10x
+    and remove the remaining growing modes. Larger ``beta`` alone does not
+    achieve that, and it degrades accuracy on coarse grids, hence the cap.
+    Distance weighting (``weight_power``) was tested and makes stability
+    worse; it is off by default.
+
+    With ``isotropic=True`` (default) the least-squares fits use physical
+    distances. Scaling R and Z separately by the node spacings (as for the
+    parallel maps) amplifies errors on strongly anisotropic meshes, where
+    the gradient across thin layers is divided by the small spacing.
     """
-    f = pol.faces()
-    vol = pol.dual_volumes()
-    tq, wq = _FACE_RULES[rule]
-    nq = len(tq)
-    n_faces = len(f["i"])
-    s, e = f["start"], f["end"]
-    d = e - s  # (n_faces, 2)
-    # normal (dZ, -dR) has length |d|; quadrature weight includes length
-    normal = np.column_stack((d[:, 1], -d[:, 0]))
-    xi = pol.points[f["i"]]
-    fp = xi[:, None, :] + s[:, None, :] + tq[None, :, None] * d[:, None, :]
-    fp = fp.reshape(-1, 2)
-    inds, w_val, w_dR, w_dZ, info = pol.lsq_weights(
-        pol.wrap(fp), order=order, gradient=True, snap_tol=None, strict=strict
-    )
-    nvec = np.repeat(normal, nq, axis=0) * np.tile(wq, n_faces)[:, None]
-    w_grad = nvec[:, :1] * w_dR + nvec[:, 1:] * w_dZ
-    fi = np.repeat(f["i"], nq)
-    fj = np.repeat(f["j"], nq)
-    fallback = info["fallback"]
+    from scipy.sparse import csr_matrix
 
-    if stabilisation:
-        edge = pol.minimum_image(pol.points[f["j"]] - xi)  # d = x_j - x_i
-        mid = pol.wrap(xi + 0.5 * edge)
-        m_inds, m_val, m_dR, m_dZ, m_info = pol.lsq_weights(
-            mid, order=order, gradient=True, snap_tol=None, strict=strict
-        )
-        fallback += m_info["fallback"]
-        c = stabilisation * np.sum(normal**2, axis=1) / np.sum(edge * normal, axis=1)
-        m_grad = -c[:, None] * (edge[:, :1] * m_dR + edge[:, 1:] * m_dZ)
-        # Append the two-point difference as two extra columns
-        k = max(inds.shape[1], m_inds.shape[1]) + 2
+    saved_h = pol.h.copy()
+    if isotropic:
+        pol.h = np.full(2, np.sqrt(saved_h[0] * saved_h[1]))
+        pol._kdtree = None
+    try:
+        f = pol.faces()
+        vol = pol.dual_volumes()
+        tq, wq = _FACE_RULES[rule]
+        nq = len(tq)
+        n_faces = len(f["i"])
+        s, e = f["start"], f["end"]
+        d = e - s  # (n_faces, 2)
+        # normal (dZ, -dR) has length |d|; quadrature weight includes length
+        normal = np.column_stack((d[:, 1], -d[:, 0]))
+        xi = pol.points[f["i"]]
+        fp = xi[:, None, :] + s[:, None, :] + tq[None, :, None] * d[:, None, :]
+        fp = fp.reshape(-1, 2)
+        lsq = {
+            "order": order,
+            "extra": extra,
+            "gradient": True,
+            "snap_tol": None,
+            "strict": strict,
+            "weight_power": weight_power,
+        }
+        inds, w_val, w_dR, w_dZ, info = pol.lsq_weights(pol.wrap(fp), **lsq)
+        nvec = np.repeat(normal, nq, axis=0) * np.tile(wq, n_faces)[:, None]
+        w_grad = nvec[:, :1] * w_dR + nvec[:, 1:] * w_dZ
+        fi = np.repeat(f["i"], nq)
+        fj = np.repeat(f["j"], nq)
+        fallback = info["fallback"]
+        beta = 0.0
+        max_re = None
 
-        def pad(a, width, fill):
-            out = np.full((a.shape[0], width), fill, dtype=a.dtype)
-            out[:, : a.shape[1]] = a
-            return out
+        if stabilisation:
+            edge = pol.minimum_image(pol.points[f["j"]] - xi)  # d = x_j - x_i
+            mid = pol.wrap(xi + 0.5 * edge)
+            m_inds, m_val, m_dR, m_dZ, m_info = pol.lsq_weights(mid, **lsq)
+            fallback += m_info["fallback"]
+            c = np.sum(normal**2, axis=1) / np.sum(edge * normal, axis=1)
+            m_grad = -c[:, None] * (edge[:, :1] * m_dR + edge[:, 1:] * m_dZ)
+            # Append the two-point difference as two extra columns
+            k = max(inds.shape[1], m_inds.shape[1]) + 2
 
-        s_inds = pad(m_inds, k, 0)
-        s_inds[:, -2] = f["i"]
-        s_inds[:, -1] = f["j"]
-        s_grad = pad(m_grad, k, 0.0)
-        s_grad[:, -2] -= c
-        s_grad[:, -1] += c
-        s_val = pad(m_val, k, 0.0)
-        inds = np.vstack([pad(inds, k, 0), s_inds])
-        w_grad = np.vstack([pad(w_grad, k, 0.0), s_grad])
-        w_val = np.vstack([pad(w_val, k, 0.0), s_val])
-        fi = np.concatenate([fi, f["i"]])
-        fj = np.concatenate([fj, f["j"]])
+            def pad(a, width, fill):
+                out = np.full((a.shape[0], width), fill, dtype=a.dtype)
+                out[:, : a.shape[1]] = a
+                return out
+
+            s_inds = pad(m_inds, k, 0)
+            s_inds[:, -2] = f["i"]
+            s_inds[:, -1] = f["j"]
+            s_grad = pad(m_grad, k, 0.0)  # for beta = 1
+            s_grad[:, -2] -= c
+            s_grad[:, -1] += c
+            s_val = pad(m_val, k, 0.0)
+            inds = np.vstack([pad(inds, k, 0), s_inds])
+            w_grad_q = pad(w_grad, k, 0.0)
+            w_val = np.vstack([pad(w_val, k, 0.0), s_val])
+            fi = np.concatenate([fi, f["i"]])
+            fj = np.concatenate([fj, f["j"]])
+
+            n, nfp = pol.n_nodes, len(fi)
+            rows = np.repeat(np.arange(nfp), inds.shape[1])
+            div = csr_matrix(
+                (
+                    np.concatenate([1.0 / vol[fi], -1.0 / vol[fj]]),
+                    (np.concatenate([fi, fj]), np.tile(np.arange(nfp), 2)),
+                ),
+                shape=(n, nfp),
+            )
+            beta = stabilisation
+            while True:
+                w_grad = np.vstack([w_grad_q, beta * s_grad])
+                grad = csr_matrix(
+                    (w_grad.ravel(), (rows, inds.ravel())), shape=(nfp, n)
+                )
+                max_re = _max_real_eigenvalue(div @ grad)
+                if max_re <= stability_tol or 2 * beta > max_stabilisation:
+                    break
+                beta *= 2
+            if max_re > stability_tol:
+                warnings.warn(
+                    f"Perpendicular operator still has growing modes "
+                    f"(max Re = {max_re:.2g} * norm) with beta = {beta}"
+                )
+    finally:
+        pol.h = saved_h
+        pol._kdtree = None
     owner_node = np.minimum(fi, fj)
     return {
         "n_fp": len(fi),
@@ -950,6 +1045,8 @@ def _plane_dagp(pol, order=3, rule="gauss2", strict=True, stabilisation=1.0):
         "owner_node": owner_node,
         "vol": vol,
         "fallback": fallback,
+        "beta": beta,
+        "max_re": max_re,
     }
 
 
@@ -980,7 +1077,7 @@ def dagp_unstructured(
     order=3,
     rule="gauss2",
     strict=True,
-    stabilisation=1.0,
+    **plane_options,
 ):
     """Global CSR matrices for ``FV::Div_a_Grad_perp_FCI_unstructured``."""
     g = grid.MXG
@@ -990,7 +1087,7 @@ def dagp_unstructured(
         pol = grid.plane(y)
         if id(pol) not in cache:
             cache[id(pol)] = _plane_dagp(
-                pol, order=order, rule=rule, strict=strict, stabilisation=stabilisation
+                pol, order=order, rule=rule, strict=strict, **plane_options
             )
         blocks.append(cache[id(pol)])
 
@@ -1039,7 +1136,11 @@ def dagp_unstructured(
         out[f"dagp_us_{name}_weights"] = vals
         out[f"dagp_us_{name}_ncols"] = ncol
     out["dagp_us_volume"] = grid.to3d(volume)
-    stats = {"fallback": sum(b["fallback"] for b in cache.values())}
+    stats = {
+        "fallback": sum(b["fallback"] for b in cache.values()),
+        "beta": max(b["beta"] for b in cache.values()),
+        "max_re": max((b["max_re"] or 0.0) for b in cache.values()),
+    }
     return out, stats
 
 
