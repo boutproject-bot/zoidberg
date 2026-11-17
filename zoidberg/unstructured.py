@@ -54,7 +54,9 @@ Perpendicular diffusion (poloidal-plane form)
 
     ``div @ ((value @ a) * (gradp @ f))`` approximates
     ``div_pol(a grad_pol f)`` with node-centred, centroid-dual finite
-    volumes. Interior dual faces connect the centroids of the two adjacent
+    volumes. Each face has quadrature points with least-squares gradients
+    plus one stabilisation point (compact two-point difference minus its
+    high-order prediction) that removes growing grid-scale modes. Interior dual faces connect the centroids of the two adjacent
     triangles; at a boundary edge the face runs from the centroid to the edge
     midpoint, and the wall itself is zero-flux.
 
@@ -872,8 +874,21 @@ def som_weights(grid, maps, order=4, strict=True, snap_tol=1e-10):
 # Perpendicular diffusion operator (poloidal-plane form)
 
 
-def _plane_dagp(pol, order=3, rule="gauss2", strict=True):
-    """Per-plane CSR blocks (local node / face-point numbering)."""
+def _plane_dagp(pol, order=3, rule="gauss2", strict=True, stabilisation=1.0):
+    """Per-plane CSR blocks (local node / face-point numbering).
+
+    Each face contributes ``nq`` quadrature points, where the flux is
+    ``a (S . grad f)`` with least-squares gradients, plus one stabilisation
+    point at the edge midpoint ``m`` with flux
+
+        beta * c * [(f_j - f_i) - d . grad f(m)],   c = |S|^2 / (d . S)
+
+    (S: face normal vector, d = x_j - x_i). The bracket is O(h^3) for smooth
+    f, so accuracy is unchanged, but the compact difference damps
+    grid-scale modes. Without it the operator has eigenvalues with positive
+    real part on irregular meshes, so explicit or implicit time stepping
+    diverges.
+    """
     f = pol.faces()
     vol = pol.dual_volumes()
     tq, wq = _FACE_RULES[rule]
@@ -891,11 +906,42 @@ def _plane_dagp(pol, order=3, rule="gauss2", strict=True):
     )
     nvec = np.repeat(normal, nq, axis=0) * np.tile(wq, n_faces)[:, None]
     w_grad = nvec[:, :1] * w_dR + nvec[:, 1:] * w_dZ
-    owner_node = np.repeat(np.minimum(f["i"], f["j"]), nq)
     fi = np.repeat(f["i"], nq)
     fj = np.repeat(f["j"], nq)
+    fallback = info["fallback"]
+
+    if stabilisation:
+        edge = pol.minimum_image(pol.points[f["j"]] - xi)  # d = x_j - x_i
+        mid = pol.wrap(xi + 0.5 * edge)
+        m_inds, m_val, m_dR, m_dZ, m_info = pol.lsq_weights(
+            mid, order=order, gradient=True, snap_tol=None, strict=strict
+        )
+        fallback += m_info["fallback"]
+        c = stabilisation * np.sum(normal**2, axis=1) / np.sum(edge * normal, axis=1)
+        m_grad = -c[:, None] * (edge[:, :1] * m_dR + edge[:, 1:] * m_dZ)
+        # Append the two-point difference as two extra columns
+        k = max(inds.shape[1], m_inds.shape[1]) + 2
+
+        def pad(a, width, fill):
+            out = np.full((a.shape[0], width), fill, dtype=a.dtype)
+            out[:, : a.shape[1]] = a
+            return out
+
+        s_inds = pad(m_inds, k, 0)
+        s_inds[:, -2] = f["i"]
+        s_inds[:, -1] = f["j"]
+        s_grad = pad(m_grad, k, 0.0)
+        s_grad[:, -2] -= c
+        s_grad[:, -1] += c
+        s_val = pad(m_val, k, 0.0)
+        inds = np.vstack([pad(inds, k, 0), s_inds])
+        w_grad = np.vstack([pad(w_grad, k, 0.0), s_grad])
+        w_val = np.vstack([pad(w_val, k, 0.0), s_val])
+        fi = np.concatenate([fi, f["i"]])
+        fj = np.concatenate([fj, f["j"]])
+    owner_node = np.minimum(fi, fj)
     return {
-        "n_fp": n_faces * nq,
+        "n_fp": len(fi),
         "inds": inds,
         "w_val": w_val,
         "w_grad": w_grad,
@@ -903,7 +949,7 @@ def _plane_dagp(pol, order=3, rule="gauss2", strict=True):
         "fj": fj,
         "owner_node": owner_node,
         "vol": vol,
-        "fallback": info["fallback"],
+        "fallback": fallback,
     }
 
 
@@ -917,7 +963,13 @@ def _csr(n_rows, row_idx, col_idx, vals):
 
 
 def dagp_unstructured(
-    grid, cell_number, total_cells, order=3, rule="gauss2", strict=True
+    grid,
+    cell_number,
+    total_cells,
+    order=3,
+    rule="gauss2",
+    strict=True,
+    stabilisation=1.0,
 ):
     """Global CSR matrices for ``FV::Div_a_Grad_perp_FCI_unstructured``."""
     g = grid.MXG
@@ -926,7 +978,9 @@ def dagp_unstructured(
     for y in range(grid.ny):
         pol = grid.plane(y)
         if id(pol) not in cache:
-            cache[id(pol)] = _plane_dagp(pol, order=order, rule=rule, strict=strict)
+            cache[id(pol)] = _plane_dagp(
+                pol, order=order, rule=rule, strict=strict, stabilisation=stabilisation
+            )
         blocks.append(cache[id(pol)])
 
     n_fp_total = sum(b["n_fp"] for b in blocks)

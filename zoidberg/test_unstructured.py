@@ -249,3 +249,31 @@ def test_walls_y_marks_boundaries():
     assert stats["backward_hits"] == pol.n_nodes
     assert np.all(data["forward_xt_prime"][1:-1, -1, 0] == grid.nx)
     assert stats["som"]["snapped"] == 2 * pol.n_nodes * 7
+
+
+def test_dagp_stable():
+    # The discrete perpendicular Laplacian must not have growing modes
+    # (eigenvalues with positive real part), otherwise time stepping diverges
+    from scipy.sparse import csr_matrix
+
+    for n in (16, 24):
+        pol = periodic_slab(n=n)
+        grid = us.UnstructuredGrid(pol, np.array([0.0]), 1.0)
+        cell_number = np.full(grid.shape, -1)
+        cell_number[1:-1, 0, 0] = np.arange(pol.n_nodes)
+        d, _ = us.dagp_unstructured(grid, cell_number, pol.n_nodes)
+        nfp = d["dagp_us_n_facepoints"]
+
+        def mat(name, shape, d=d):
+            return csr_matrix(
+                (
+                    d[f"dagp_us_{name}_weights"],
+                    d[f"dagp_us_{name}_columns"],
+                    d[f"dagp_us_{name}_rows"],
+                ),
+                shape=shape,
+            )
+
+        L = mat("div", (pol.n_nodes, nfp)) @ mat("gradp", (nfp, pol.n_nodes))
+        ev = np.linalg.eigvals(L.toarray())
+        assert ev.real.max() < 1e-8 * np.abs(ev.real).max()
