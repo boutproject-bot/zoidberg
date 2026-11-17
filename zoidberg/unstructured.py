@@ -36,7 +36,8 @@ Parallel operators (support operator method, read by ``PetscOperators``)
     These use the same names and numbering scheme as
     :func:`zoidberg.weights.calculate_parallel_map_operators`, with
     single-sample legs. Interior leg rows hold a value-interpolation stencil:
-    a least-squares fit of order ``p = 3`` over the ``k = 14`` nearest
+    a least-squares fit of order ``p = 4`` (default ``map_order``) over the
+    ``num_coefs(p) + 4`` nearest
     target-plane nodes in anisotropically scaled coordinates
     ``(R/h_R, Z/h_Z)``, using minimum-image offsets in periodic directions.
     If an end point coincides with a node (within ``snap_tol*h``), the row is
@@ -771,7 +772,7 @@ def trace_maps(grid, field, rtol=1e-10, field_tracer=None):
 # Parallel (support operator method) weights
 
 
-def som_weights(grid, maps, order=3, strict=True, snap_tol=1e-10):
+def som_weights(grid, maps, order=4, strict=True, snap_tol=1e-10):
     """Cell numbering, leg metadata and CSR operators for ``PetscOperators``.
 
     Uses the numbering of :func:`zoidberg.weights.assign_cell_space_numbers`:
@@ -1076,16 +1077,26 @@ def slab_metric(grid, field, maps, volume):
 # Top level
 
 
-def build_grid_data(grid, field, order=3, rule="gauss2", strict=True, rtol=1e-10):
+def build_grid_data(
+    grid, field, map_order=4, dagp_order=3, rule="gauss2", strict=True, rtol=1e-10
+):
     """Compute every variable of the grid-file contract. Returns
-    ``(data, stats)``."""
+    ``(data, stats)``.
+
+    ``map_order`` is the polynomial order of the parallel-map interpolation.
+    Cubic exactness (order 3) is the minimum for second-order parallel second
+    derivatives; on irregular meshes its O(h^4) error is still
+    pre-asymptotic at typical resolutions, so order 4 is the default.
+    ``dagp_order`` is the order of the face gradient/value fits of the
+    perpendicular operator.
+    """
     maps = trace_maps(grid, field, rtol=rtol)
-    som, som_stats = som_weights(grid, maps, order=order, strict=strict)
+    som, som_stats = som_weights(grid, maps, order=map_order, strict=strict)
     dagp, dagp_stats = dagp_unstructured(
         grid,
         som["cell_number"],
         som["total_cells"],
-        order=order,
+        order=dagp_order,
         rule=rule,
         strict=strict,
     )
@@ -1146,7 +1157,8 @@ def make_unstructured_grid(
     Ly,
     yperiodic=True,
     walls_y=False,
-    order=3,
+    map_order=4,
+    dagp_order=3,
     rule="gauss2",
     strict=True,
     multiple_of=4,
@@ -1161,7 +1173,14 @@ def make_unstructured_grid(
         walls_y=walls_y,
         multiple_of=multiple_of,
     )
-    data, stats = build_grid_data(grid, field, order=order, rule=rule, strict=strict)
+    data, stats = build_grid_data(
+        grid,
+        field,
+        map_order=map_order,
+        dagp_order=dagp_order,
+        rule=rule,
+        strict=strict,
+    )
     if filename is not None:
         write_unstructured(filename, grid, data)
     return grid, data, stats
