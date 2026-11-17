@@ -291,3 +291,60 @@ def test_dagp_stable():
         L = mat("div", (pol.n_nodes, nfp)) @ mat("gradp", (nfp, pol.n_nodes))
         ev = np.linalg.eigvals(L.toarray())
         assert ev.real.max() < 1e-8 * np.abs(ev.real).max()
+
+
+def test_dirichlet_walls_layout_and_order():
+    # Wall nodes go into the x guard cells and get no divergence row; with
+    # exact wall values the operator is second order on the evolving nodes
+    from scipy.sparse import csr_matrix
+
+    errs = []
+    for n in (16, 32):
+        pol = us.UnstructuredPoloidalGrid.slab(
+            n + 1,
+            n,
+            1.0,
+            1.0,
+            R0=0.0,
+            jitter=0.2,
+            jitter_dirs="rz",
+            periodic_R=False,
+            periodic_Z=True,
+            seed=7 + n,
+            r_on_walls=True,
+        )
+        grid = us.UnstructuredGrid(pol, np.array([0.0]), 1.0, dirichlet_walls=True)
+        assert grid.MXG == n and grid.n_interior == (n - 1) * n
+        assert grid.nx == grid.n_interior + 2 * n
+        field = zbfield.Slab(Bz=0.0, Bzprime=0.0)
+        data, stats = us.build_grid_data(grid, field)
+        assert stats["dagp"]["max_re"] <= 1e-10
+        cn = data["cell_number"][:, 0, 0]
+        assert np.all(cn[: grid.MXG] >= 0) and np.all(cn[-grid.MXG :] >= 0)
+        nc, nfp = data["total_cells"], data["dagp_us_n_facepoints"]
+
+        def mat(name, shape, data=data):
+            return csr_matrix(
+                (
+                    data[f"dagp_us_{name}_weights"],
+                    data[f"dagp_us_{name}_columns"],
+                    data[f"dagp_us_{name}_rows"],
+                ),
+                shape=shape,
+            )
+
+        G, V, D = (
+            mat("gradp", (nfp, nc)),
+            mat("value", (nfp, nc)),
+            mat("div", (nc, nfp)),
+        )
+        node_cells = cn[grid.node_x]
+        k = 2 * np.pi
+        f = np.zeros(nc)
+        f[node_cells] = np.sin(k * pol.R) * np.cos(k * pol.Z)
+        res = (D @ (V @ np.ones(nc) * (G @ f)))[node_cells]
+        ex = -2 * k * k * np.sin(k * pol.R) * np.cos(k * pol.Z)
+        assert np.all(res[~grid.interior] == 0.0)  # walls are not evolved
+        e = (res - ex)[grid.interior]
+        errs.append(np.sqrt(np.mean(e**2)))
+    assert np.log2(errs[0] / errs[1]) > 1.8, errs

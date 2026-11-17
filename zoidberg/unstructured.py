@@ -21,6 +21,16 @@ Layout ("nodes along x")
     ``multiple_of`` (default 4) so that ``NXPE`` in {1, 2, 4} divides the
     interior. Nodes are sorted in Morton (Z-order) to improve locality.
 
+Dirichlet walls (optional, ``dirichlet_walls=True``)
+    For domains that are not periodic in R, the nodes on the two R walls are
+    stored in the x guard cells instead: inner-wall nodes at
+    ``x = 0 .. n_inner-1``, outer-wall nodes at the end, and
+    ``MXG = max(n_inner, n_outer)``. They have ``cell_number >= 0`` (the
+    x-boundary cells of the cell space), no divergence row and no parallel
+    legs. BOUT++ does not evolve them; set them with the ``dirichlet_node``
+    boundary condition, which evaluates the boundary value at each guard
+    cell. ``n_nodes`` then counts all nodes, and ``nx = n_evolving + 2*MXG``.
+
 Flag
     ``unstructured = 1`` (int).
 
@@ -209,11 +219,13 @@ class UnstructuredPoloidalGrid:
         seed=0,
         morton=True,
         relax=True,
+        r_on_walls=False,
     ):
         """Jittered lattice on ``[R0, R0+Lx] x [Z0, Z0+Lz)``.
 
         R positions are cell centred, ``R0 + (i + 1/2) Lx/nR``, as for BOUT++
-        with ``symmetricglobalx``. Z positions are ``Z0 + k Lz/nZ``, matching
+        with ``symmetricglobalx``, or with ``r_on_walls`` evenly spaced from
+        ``R0`` to ``R0 + Lx`` so that nodes lie on both walls. Z positions are ``Z0 + k Lz/nZ``, matching
         BOUT++ ``z = 2 pi k / nz``. Each lattice quadrilateral is split
         along a randomly chosen diagonal, which gives irregular connectivity.
         With ``jitter <= 0.25`` every quadrilateral stays convex, so the
@@ -231,7 +243,14 @@ class UnstructuredPoloidalGrid:
         rng = np.random.default_rng(seed)
         hR, hZ = Lx / nR, Lz / nZ
         i, k = np.meshgrid(np.arange(nR), np.arange(nZ), indexing="ij")
-        R = R0 + (i + 0.5) * hR
+        if r_on_walls:
+            if periodic_R:
+                raise ValueError("r_on_walls needs a domain that is not periodic in R")
+            # Nodes on both walls (R0 and R0 + Lx), e.g. for Dirichlet walls
+            hR = Lx / (nR - 1)
+            R = R0 + i * hR
+        else:
+            R = R0 + (i + 0.5) * hR
         Z = Z0 + k * hZ
         if "r" in jitter_dirs.lower():
             dR = rng.uniform(-jitter, jitter, R.shape) * hR
@@ -666,6 +685,7 @@ class UnstructuredGrid:
     MXG: int = 1
     MYG: int = 1
     multiple_of: int = 4
+    dirichlet_walls: bool = False
     _planes: list = dc_field(default_factory=list, init=False, repr=False)
 
     def __post_init__(self):
@@ -681,9 +701,10 @@ class UnstructuredGrid:
         if len(n) != 1:
             raise ValueError("All planes must have the same number of nodes")
         self.n_nodes = n.pop()
-        if self.n_nodes % self.multiple_of != 0:
+        self._layout()
+        if self.n_interior % self.multiple_of != 0:
             raise ValueError(
-                f"n_nodes = {self.n_nodes} is not a multiple of {self.multiple_of}"
+                f"{self.n_interior} evolving nodes is not a multiple of {self.multiple_of}"
             )
         if self.MYG != 1:
             raise ValueError("Only MYG = 1 is supported for unstructured grids")
@@ -692,9 +713,61 @@ class UnstructuredGrid:
     def ny(self):
         return len(self.ycoords)
 
+    def _layout(self):
+        """x index of every node (``node_x``) and which nodes evolve.
+
+        Without Dirichlet walls node k is at ``MXG + k``. With
+        ``dirichlet_walls`` the nodes on the walls of a non-periodic R
+        domain go into the x guard cells: inner-wall nodes at the start,
+        outer-wall nodes at the end. ``MXG`` is the larger of the two counts.
+        BOUT++ does not evolve guard cells and sets them with the
+        ``dirichlet_node`` boundary condition.
+        """
+        n = self.n_nodes
+        if not self.dirichlet_walls:
+            self.node_x = self.MXG + np.arange(n)
+            self.interior = np.ones(n, dtype=bool)
+        else:
+            pol = self._planes[0]
+            if np.isfinite(pol.period[0]):
+                raise ValueError(
+                    "dirichlet_walls needs a domain that is not periodic in R"
+                )
+            tol = 1e-9 * np.ptp(pol.R)
+            inner = np.flatnonzero(pol.R <= pol.R.min() + tol)
+            outer = np.flatnonzero(pol.R >= pol.R.max() - tol)
+            for other in self._planes[1:]:
+                if not (
+                    np.array_equal(np.flatnonzero(other.R <= pol.R.min() + tol), inner)
+                    and np.array_equal(
+                        np.flatnonzero(other.R >= pol.R.max() - tol), outer
+                    )
+                ):
+                    raise ValueError("All planes must have the same wall nodes")
+            self.MXG = max(len(inner), len(outer))
+            self.interior = np.ones(n, dtype=bool)
+            self.interior[inner] = False
+            self.interior[outer] = False
+            n_int = int(self.interior.sum())
+            self.node_x = np.empty(n, dtype=int)
+            self.node_x[inner] = np.arange(len(inner))
+            self.node_x[self.interior] = self.MXG + np.arange(n_int)
+            self.node_x[outer] = self.MXG + n_int + np.arange(len(outer))
+        self.n_interior = int(self.interior.sum())
+        # For guard-cell padding: copy from the nearest occupied x index
+        occupied = np.zeros(self.nx, dtype=bool)
+        occupied[self.node_x] = True
+        xs = np.flatnonzero(occupied)
+        nearest = xs[
+            np.argmin(np.abs(np.arange(self.nx)[:, None] - xs[None, :]), axis=1)
+        ]
+        node_at = np.full(self.nx, -1)
+        node_at[self.node_x] = np.arange(n)
+        self._fill_node = node_at[nearest]
+
     @property
     def nx(self):
-        return self.n_nodes + 2 * self.MXG
+        return self.n_interior + 2 * self.MXG
 
     @property
     def shape(self):
@@ -716,10 +789,7 @@ class UnstructuredGrid:
         with guard cells copied from the nearest node."""
         per_plane = np.asarray(per_plane)
         out = np.empty(self.shape, dtype=per_plane.dtype)
-        g = self.MXG
-        out[g : g + self.n_nodes, :, 0] = per_plane.T
-        out[:g, :, 0] = per_plane[:, :1].T
-        out[g + self.n_nodes :, :, 0] = per_plane[:, -1:].T
+        out[:, :, 0] = per_plane[:, self._fill_node].T
         return out
 
 
@@ -793,25 +863,33 @@ def som_weights(grid, maps, order=4, strict=True, snap_tol=1e-10):
     virtual cells. Legs are single-sample.
     """
     nx, ny, _ = grid.shape
-    g, n = grid.MXG, grid.n_nodes
+    node_x = grid.node_x
+    by_x = np.argsort(node_x)
+    evolving = by_x[grid.interior[by_x]]
+    walls = by_x[~grid.interior[by_x]]
 
     cell_number = np.full((nx, ny, 1), -1, dtype=int)
     next_cell = 0
-    for x in range(g, g + n):
+    for k in evolving:
         for y in range(ny):
-            cell_number[x, y, 0] = next_cell
+            cell_number[node_x[k], y, 0] = next_cell
             next_cell += 1
     n_evolving = next_cell
+    # Dirichlet wall nodes (x boundary cells), inner then outer
+    for k in walls:
+        for y in range(ny):
+            cell_number[node_x[k], y, 0] = next_cell
+            next_cell += 1
 
     fwd_bnd = np.full((nx, ny, 1), -1, dtype=int)
     bwd_bnd = np.full((nx, ny, 1), -1, dtype=int)
-    for x in range(g, g + n):
+    for k in evolving:
         for y in range(ny):
-            if maps["backward_hit"][y, x - g] != 0:
-                bwd_bnd[x, y, 0] = next_cell
+            if maps["backward_hit"][y, k] != 0:
+                bwd_bnd[node_x[k], y, 0] = next_cell
                 next_cell += 1
-            if maps["forward_hit"][y, x - g] != 0:
-                fwd_bnd[x, y, 0] = next_cell
+            if maps["forward_hit"][y, k] != 0:
+                fwd_bnd[node_x[k], y, 0] = next_cell
                 next_cell += 1
 
     result = {
@@ -827,12 +905,12 @@ def som_weights(grid, maps, order=4, strict=True, snap_tol=1e-10):
         interior_leg = np.full((nx, ny, 1), -1, dtype=int)
         boundary_leg = np.full((nx, ny, 1), -1, dtype=int)
         next_leg = 0
-        for x in range(g, g + n):
+        for k in evolving:
             for y in range(ny):
-                if hit[y, x - g] == 0:
-                    interior_leg[x, y, 0] = next_leg
+                if hit[y, k] == 0:
+                    interior_leg[node_x[k], y, 0] = next_leg
                 else:
-                    boundary_leg[x, y, 0] = next_leg
+                    boundary_leg[node_x[k], y, 0] = next_leg
                 next_leg += 1
         n_legs = next_leg
 
@@ -841,7 +919,7 @@ def som_weights(grid, maps, order=4, strict=True, snap_tol=1e-10):
         for y in range(ny):
             yt = (y + sign) % ny
             target = grid.plane(yt)
-            src = np.flatnonzero(hit[y] == 0)
+            src = np.flatnonzero((hit[y] == 0) & grid.interior)
             if len(src):
                 pos = np.column_stack(
                     (maps[f"{name}_R"][y, src], maps[f"{name}_Z"][y, src])
@@ -853,11 +931,11 @@ def som_weights(grid, maps, order=4, strict=True, snap_tol=1e-10):
                 stats["snapped"] += info["snapped"]
                 for s, ii, ww in zip(src, inds, w):
                     keep = np.abs(ww) > 1e-14
-                    cols = cell_number[g + ii[keep], yt, 0]
-                    rows[interior_leg[g + s, y, 0]] = (cols, ww[keep])
-            for s in np.flatnonzero(hit[y] != 0):
-                rows[boundary_leg[g + s, y, 0]] = (
-                    np.array([bnd[g + s, y, 0]]),
+                    cols = cell_number[node_x[ii[keep]], yt, 0]
+                    rows[interior_leg[node_x[s], y, 0]] = (cols, ww[keep])
+            for s in np.flatnonzero((hit[y] != 0) & grid.interior):
+                rows[boundary_leg[node_x[s], y, 0]] = (
+                    np.array([bnd[node_x[s], y, 0]]),
                     np.array([1.0]),
                 )
         ptr = np.zeros(n_legs + 1, dtype=int)
@@ -1080,8 +1158,13 @@ def dagp_unstructured(
     strict=True,
     **plane_options,
 ):
-    """Global CSR matrices for ``FV::Div_a_Grad_perp_FCI_unstructured``."""
-    g = grid.MXG
+    """Global CSR matrices for ``FV::Div_a_Grad_perp_FCI_unstructured``.
+
+    Only evolving nodes get a divergence row. Face points between two
+    Dirichlet wall nodes are dropped; faces between a wall node and an
+    evolving node use the wall value, which BOUT++ holds in the guard cell.
+    """
+    interior = grid.interior
     cache = {}
     blocks = []
     for y in range(grid.ny):
@@ -1092,31 +1175,36 @@ def dagp_unstructured(
             )
         blocks.append(cache[id(pol)])
 
-    n_fp_total = sum(b["n_fp"] for b in blocks)
+    keeps = [interior[b["fi"]] | interior[b["fj"]] for b in blocks]
+    n_fp_total = int(sum(np.sum(k) for k in keeps))
     gr, gc, gv = [], [], []
     vr, vc, vv = [], [], []
     dr, dc, dv = [], [], []
     owner = np.empty(n_fp_total, dtype=int)
     volume = np.zeros((grid.ny, grid.n_nodes))
     offset = 0
-    for y, b in enumerate(blocks):
-        cells = cell_number[g : g + grid.n_nodes, y, 0]
-        nfp = b["n_fp"]
+    for y, (b, keep) in enumerate(zip(blocks, keeps)):
+        cells = cell_number[grid.node_x, y, 0]
+        nfp = int(np.sum(keep))
         rows = offset + np.arange(nfp)
-        k = b["inds"].shape[1]
+        inds, fi, fj = b["inds"][keep], b["fi"][keep], b["fj"][keep]
+        k = inds.shape[1]
         gr.append(np.repeat(rows, k))
-        gc.append(cells[b["inds"]].ravel())
-        gv.append(b["w_grad"].ravel())
+        gc.append(cells[inds].ravel())
+        gv.append(b["w_grad"][keep].ravel())
         vr.append(np.repeat(rows, k))
-        vc.append(cells[b["inds"]].ravel())
-        vv.append(b["w_val"].ravel())
-        dr.append(cells[b["fi"]])
-        dc.append(rows)
-        dv.append(1.0 / b["vol"][b["fi"]])
-        dr.append(cells[b["fj"]])
-        dc.append(rows)
-        dv.append(-1.0 / b["vol"][b["fj"]])
-        owner[rows] = cells[b["owner_node"]]
+        vc.append(cells[inds].ravel())
+        vv.append(b["w_val"][keep].ravel())
+        mi, mj = interior[fi], interior[fj]
+        dr.append(cells[fi][mi])
+        dc.append(rows[mi])
+        dv.append(1.0 / b["vol"][fi][mi])
+        dr.append(cells[fj][mj])
+        dc.append(rows[mj])
+        dv.append(-1.0 / b["vol"][fj][mj])
+        # Owned with an evolving node
+        owner_node = np.where(mi & mj, np.minimum(fi, fj), np.where(mi, fi, fj))
+        owner[rows] = cells[owner_node]
         volume[y] = b["vol"]
         offset += nfp
 
@@ -1275,7 +1363,6 @@ def build_grid_data(
     data.update(som)
     data.update(dagp)
 
-    g = grid.MXG
     R = np.array([grid.plane(j).R for j in range(grid.ny)])
     Z = np.array([grid.plane(j).Z for j in range(grid.ny)])
     data["R"] = grid.to3d(R)
@@ -1285,13 +1372,14 @@ def build_grid_data(
         data[f"{name}_R"] = grid.to3d(maps[f"{name}_R"])
         data[f"{name}_Z"] = grid.to3d(maps[f"{name}_Z"])
         hit = maps[f"{name}_hit"]
-        node_index = g + np.arange(grid.n_nodes)[None, :] + 0.0 * hit
+        node_index = grid.node_x[None, :] + 0.0 * hit
         xt = np.where(hit == 0, node_index, np.where(hit > 0, grid.nx, -1.0))
         data[f"{name}_xt_prime"] = grid.to3d(xt)
         data[f"{name}_zt_prime"] = np.zeros(grid.shape)
         # The leg classification must agree with the sentinels
-        cls = data[f"{name}_leg_interior_number"][g : g + grid.n_nodes, :, 0].T >= 0
-        if not np.array_equal(cls, hit == 0):
+        evolving = grid.interior
+        legs = data[f"{name}_leg_interior_number"][grid.node_x[evolving], :, 0].T
+        if not np.array_equal(legs >= 0, hit[:, evolving] == 0):
             raise AssertionError(f"{name}: leg classification disagrees with xt_prime")
     data["unstructured"] = 1
     data["MXG"] = grid.MXG
@@ -1331,6 +1419,7 @@ def make_unstructured_grid(
     rule="gauss2",
     strict=True,
     multiple_of=4,
+    dirichlet_walls=False,
 ):
     """Convenience wrapper: build the 3D grid, compute and write all data."""
     ycoords = np.linspace(0.0, Ly, ny, endpoint=False)
@@ -1341,6 +1430,7 @@ def make_unstructured_grid(
         yperiodic=yperiodic,
         walls_y=walls_y,
         multiple_of=multiple_of,
+        dirichlet_walls=dirichlet_walls,
     )
     data, stats = build_grid_data(
         grid,
