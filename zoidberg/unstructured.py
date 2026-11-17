@@ -954,8 +954,19 @@ def _plane_dagp(pol, order=3, rule="gauss2", strict=True, stabilisation=1.0):
 
 
 def _csr(n_rows, row_idx, col_idx, vals):
+    """CSR arrays with sorted, unique columns in each row.
+
+    Duplicate (row, column) entries are summed: BOUT++ inserts the entries
+    into PETSc with INSERT_VALUES, which would keep only one of them.
+    """
     order = np.lexsort((col_idx, row_idx))
     row_idx, col_idx, vals = row_idx[order], col_idx[order], vals[order]
+    if len(row_idx):
+        new = np.ones(len(row_idx), dtype=bool)
+        new[1:] = (row_idx[1:] != row_idx[:-1]) | (col_idx[1:] != col_idx[:-1])
+        group = np.cumsum(new) - 1
+        vals = np.bincount(group, weights=vals)
+        row_idx, col_idx = row_idx[new], col_idx[new]
     ptr = np.zeros(n_rows + 1, dtype=int)
     np.add.at(ptr, row_idx + 1, 1)
     np.cumsum(ptr, out=ptr)

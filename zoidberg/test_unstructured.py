@@ -226,6 +226,18 @@ def test_contract_variables_finite(tmp_path):
         v = np.asarray(data[name])
         assert np.all(np.isfinite(v)), name
     assert data["cell_number"].shape == grid.shape
+    # BOUT++ inserts CSR entries with INSERT_VALUES: columns must be unique
+    for name in (
+        "forward",
+        "backward",
+        "dagp_us_div",
+        "dagp_us_gradp",
+        "dagp_us_value",
+    ):
+        rows, cols = data[f"{name}_rows"], data[f"{name}_columns"]
+        for r in range(len(rows) - 1):
+            c = cols[rows[r] : rows[r + 1]]
+            assert len(np.unique(c)) == len(c), f"{name} row {r}"
     assert np.all(data["cell_number"][0] == -1) and np.all(
         data["cell_number"][-1] == -1
     )
