@@ -60,7 +60,12 @@ Perpendicular diffusion (poloidal-plane form)
     stored cell numbers; face-point indices are global. Also written:
     ``dagp_us_n_facepoints``, ``dagp_us_facepoint_owner`` (stored cell
     number of the lower-numbered node of each face) and ``dagp_us_volume``
-    (dual-cell area, a Field3D).
+    (dual-cell area, a Field3D). Optional (written by this module, used for
+    upwinding and flows): ``dagp_us_left``/``dagp_us_right`` (second-order
+    upwind reconstruction a_side + (x_f - x_side).grad a(side) from the node
+    on either side of each face point) and ``dagp_us_flowR``/
+    ``dagp_us_flowZ`` (cell average of the flux vector -a grad f,
+    ``(1/V) sum_f (x_f - x_node) * outward flux``, exact for linear f).
 
     ``div @ ((value @ a) * (gradp @ f))`` approximates
     ``div_pol(a grad_pol f)`` with node-centred, centroid-dual finite
@@ -1054,12 +1059,17 @@ def _plane_dagp(
         w_grad = nvec[:, :1] * w_dR + nvec[:, 1:] * w_dZ
         fi = np.repeat(f["i"], nq)
         fj = np.repeat(f["j"], nq)
-        fallback = info["fallback"]
+        # Face-point positions relative to node i, and x_j - x_i (for flows)
+        edge = pol.minimum_image(pol.points[f["j"]] - xi)
+        # Least-squares gradients at the nodes (for upwind reconstruction)
+        n_inds, _, n_dR, n_dZ, n_info = pol.lsq_weights(pol.points, **lsq)
+        pos_i = (s[:, None, :] + tq[None, :, None] * d[:, None, :]).reshape(-1, 2)
+        edge_fp = np.repeat(edge, nq, axis=0)
+        fallback = info["fallback"] + n_info["fallback"]
         beta = 0.0
         max_re = None
 
         if stabilisation:
-            edge = pol.minimum_image(pol.points[f["j"]] - xi)  # d = x_j - x_i
             mid = pol.wrap(xi + 0.5 * edge)
             m_inds, m_val, m_dR, m_dZ, m_info = pol.lsq_weights(mid, **lsq)
             fallback += m_info["fallback"]
@@ -1085,6 +1095,8 @@ def _plane_dagp(
             w_val = np.vstack([pad(w_val, k, 0.0), s_val])
             fi = np.concatenate([fi, f["i"]])
             fj = np.concatenate([fj, f["j"]])
+            pos_i = np.vstack([pos_i, 0.5 * edge])
+            edge_fp = np.vstack([edge_fp, edge])
 
             n, nfp = pol.n_nodes, len(fi)
             rows = np.repeat(np.arange(nfp), inds.shape[1])
@@ -1114,6 +1126,23 @@ def _plane_dagp(
         pol.h = saved_h
         pol._kdtree = None
     owner_node = np.minimum(fi, fj)
+
+    # Second-order upwind reconstruction of a from either side of each face
+    # point: a_side + (x_f - x_side) . grad a(side)
+    def reconstruction(node, offset):
+        k = n_inds.shape[1]
+        cols = np.column_stack([node, n_inds[node]])
+        w = np.column_stack(
+            [
+                np.ones(len(node)),
+                offset[:, :1] * n_dR[node] + offset[:, 1:] * n_dZ[node],
+            ]
+        )
+        assert cols.shape[1] == k + 1
+        return cols, w
+
+    left_inds, left_w = reconstruction(fi, pos_i)
+    right_inds, right_w = reconstruction(fj, pos_i - edge_fp)
     return {
         "n_fp": len(fi),
         "inds": inds,
@@ -1122,6 +1151,12 @@ def _plane_dagp(
         "fi": fi,
         "fj": fj,
         "owner_node": owner_node,
+        "pos_i": pos_i,
+        "edge": edge_fp,
+        "left_inds": left_inds,
+        "left_w": left_w,
+        "right_inds": right_inds,
+        "right_w": right_w,
         "vol": vol,
         "fallback": fallback,
         "beta": beta,
@@ -1180,6 +1215,8 @@ def dagp_unstructured(
     gr, gc, gv = [], [], []
     vr, vc, vv = [], [], []
     dr, dc, dv = [], [], []
+    lr, lc, lv, rr, rc, rv = [], [], [], [], [], []  # upwind reconstructions
+    fr, fc, fR, fZ = [], [], [], []  # cell-averaged flux vector
     owner = np.empty(n_fp_total, dtype=int)
     volume = np.zeros((grid.ny, grid.n_nodes))
     offset = 0
@@ -1202,6 +1239,22 @@ def dagp_unstructured(
         dr.append(cells[fj][mj])
         dc.append(rows[mj])
         dv.append(-1.0 / b["vol"][fj][mj])
+        kl = b["left_inds"].shape[1]
+        lr.append(np.repeat(rows, kl))
+        lc.append(cells[b["left_inds"][keep]].ravel())
+        lv.append(b["left_w"][keep].ravel())
+        rr.append(np.repeat(rows, kl))
+        rc.append(cells[b["right_inds"][keep]].ravel())
+        rv.append(b["right_w"][keep].ravel())
+        # The physical flux is -a grad f, so the outward flux of node i through
+        # this face point is -F (F = a S.grad f) and that of node j is +F.
+        # Cell average of the flux vector: sum (x_f - x_node) * outward / V
+        pos_i, pos_j = b["pos_i"][keep], b["pos_i"][keep] - b["edge"][keep]
+        vi, vj = b["vol"][fi], b["vol"][fj]
+        fr += [cells[fi][mi], cells[fj][mj]]
+        fc += [rows[mi], rows[mj]]
+        fR += [-pos_i[mi, 0] / vi[mi], pos_j[mj, 0] / vj[mj]]
+        fZ += [-pos_i[mi, 1] / vi[mi], pos_j[mj, 1] / vj[mj]]
         # Owned with an evolving node
         owner_node = np.where(mi & mj, np.minimum(fi, fj), np.where(mi, fi, fj))
         owner[rows] = cells[owner_node]
@@ -1218,6 +1271,10 @@ def dagp_unstructured(
         "gradp": (gr, gc, gv, n_fp_total, total_cells),
         "value": (vr, vc, vv, n_fp_total, total_cells),
         "div": (dr, dc, dv, total_cells, n_fp_total),
+        "left": (lr, lc, lv, n_fp_total, total_cells),
+        "right": (rr, rc, rv, n_fp_total, total_cells),
+        "flowR": (fr, fc, fR, total_cells, n_fp_total),
+        "flowZ": (fr, fc, fZ, total_cells, n_fp_total),
     }.items():
         ptr, cols, vals = build(r, c, v, nrow)
         out[f"dagp_us_{name}_rows"] = ptr

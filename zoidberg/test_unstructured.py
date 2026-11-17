@@ -348,3 +348,55 @@ def test_dirichlet_walls_layout_and_order():
         e = (res - ex)[grid.interior]
         errs.append(np.sqrt(np.mean(e**2)))
     assert np.log2(errs[0] / errs[1]) > 1.8, errs
+
+
+def test_dagp_flows_and_conservation():
+    # Flux conservation and the cell-averaged flux vector (exact for linear f)
+    from scipy.sparse import csr_matrix
+
+    pol = periodic_slab(n=12)
+    grid = us.UnstructuredGrid(pol, np.array([0.0]), 1.0)
+    cell_number = np.full(grid.shape, -1)
+    cell_number[1:-1, 0, 0] = np.arange(pol.n_nodes)
+    d, _ = us.dagp_unstructured(grid, cell_number, pol.n_nodes)
+    n, nfp = pol.n_nodes, d["dagp_us_n_facepoints"]
+
+    def mat(name, shape):
+        return csr_matrix(
+            (
+                d[f"dagp_us_{name}_weights"],
+                d[f"dagp_us_{name}_columns"],
+                d[f"dagp_us_{name}_rows"],
+            ),
+            shape=shape,
+        )
+
+    G, Vv, D = mat("gradp", (nfp, n)), mat("value", (nfp, n)), mat("div", (n, nfp))
+    L, Rt = mat("left", (nfp, n)), mat("right", (nfp, n))
+    FR, FZ = mat("flowR", (n, nfp)), mat("flowZ", (n, nfp))
+    V = pol.dual_volumes()
+    rng = np.random.default_rng(3)
+    f, a = rng.normal(size=n), 1.0 + rng.uniform(size=n)
+    flux = (Vv @ a) * (G @ f)
+    # Conservation: every face-point flux leaves one cell and enters another
+    assert abs(np.sum(V * (D @ flux))) < 1e-10 * np.sum(V * np.abs(D @ flux))
+    # Left/right reconstructions are exact for constants and (locally) linear a
+    assert np.allclose(L @ np.ones(n), 1) and np.allclose(Rt @ np.ones(n), 1)
+    # Linear f with a = 1 (local, so use minimum-image offsets from node 0):
+    # the flux vector -grad f = (-2, 3) is reproduced at every node
+    off = pol.minimum_image(pol.points - pol.points[0])
+    mask = np.all(np.abs(off) < 0.25, axis=1)  # away from the periodic seam
+    flin = 2.0 * off[:, 0] - 3.0 * off[:, 1]
+    flux = Vv @ np.ones(n) * (G @ flin)
+    qR, qZ = FR @ flux, FZ @ flux
+    inner = mask & np.all(np.abs(off) < 0.1, axis=1)
+    assert np.allclose(qR[inner], -2.0, atol=1e-9)
+    assert np.allclose(qZ[inner], 3.0, atol=1e-9)
+    # Both reconstructions of a linear a at a face point are exact, so they
+    # agree wherever their stencils avoid the periodic seam
+    alin = 1.0 + 0.5 * off[:, 0] + 0.25 * off[:, 1]
+    smooth = np.all(np.abs(off) < 0.45, axis=1)  # linear away from the seam
+    outside = (~smooth).astype(float)
+    rows = np.flatnonzero((abs(L) @ outside == 0) & (abs(Rt) @ outside == 0))
+    assert len(rows) > 0
+    assert np.allclose((L @ alin)[rows], (Rt @ alin)[rows], atol=1e-9)
