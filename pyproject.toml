@@ -49,6 +49,11 @@ tests = [
     "xarray",
     "shapely",
 ]
+# Meshing for zoidberg.unstructured (imported lazily, only when used)
+unstructured = [
+    "gmsh >= 4.11",
+    "meshio >= 5.0",
+]
 
 [project.scripts]
 zoidberg-rotating-ellipse = "zoidberg.examples.rotating_ellipse:main"
