@@ -436,6 +436,11 @@ def test_cylindrical_operator_and_metric():
         R3 = data["R"]
         assert np.allclose(data["g_22"], R3**2)
         assert np.allclose(data["forward_g_22"], data["forward_R"] ** 2)
+        # Staggered metric (field lines at constant R): g_22 at the half-step
+        # points equals g_22 = R^2, and By_cell is B_y = 1/R itself
+        for post in ("_cell_yhigh", "_cell_ylow"):
+            assert np.allclose(data[f"g_22{post}"], data["g_22"])
+            assert np.allclose(data[f"By{post}"], 1.0 / R3)
         nc, nfp = data["total_cells"], data["dagp_us_n_facepoints"]
 
         def mat(name, shape, data=data):

@@ -121,7 +121,7 @@ import numpy as np
 from scipy.spatial import KDTree
 
 from . import fieldtracer
-from .field import Slab
+from .field import MagneticField, Slab
 
 # Gauss-Legendre and Boole rules on [0, 1]: (positions, weights)
 _FACE_RULES = {
@@ -1792,10 +1792,11 @@ def slab_metric(grid, field, maps, volume):
                 maps[f"{name}_half_Z"][j],
                 grid.ycoords[j] + 0.5 * sign * dy[j],
             )
+        # g_22 from B_y / R (as g_22 at the nodes); By_cell_* is B_y itself
+        metric[f"g_22{post}"] = grid.to3d((Bh / Byh) ** 2)
         if cylindrical:
             Byh = Byh * maps[f"{name}_half_R"]
         metric[f"By{post}"] = grid.to3d(Byh)
-        metric[f"g_22{post}"] = grid.to3d((Bh / Byh) ** 2)
 
     for name, sign in (("forward", +1), ("backward", -1)):
         Bm = np.zeros((ny, n))
@@ -2050,14 +2051,80 @@ BOUT_MMS = {
 # an annulus R in [1, 2] with Dirichlet walls, periodic in Z (Lz = 1).
 BOUT_MMS_CYL = {"R0": 1.0, "Lx": 1.0, "Lz": 1.0, "ny": 4, "jitter": 0.2, "seed": 4321}
 
+# Cylindrical grids with a sheared field for the parallel operators: the
+# annulus of BOUT_MMS_CYL with B_phi = 1/R and a vertical field
+# B_Z = Bz0 + Bzprime (R - Rc), so that field lines move in Z (periodic) and
+# the parallel maps interpolate; n planes over the full torus. The walls are
+# evolving nodes by default (field lines do not reach them), so that the
+# support operators conserve exactly; with dirichlet_walls=True part of the
+# parallel flux goes into the wall nodes through the interpolation stencils.
+BOUT_MMS_CYL_SHEARED = dict(
+    BOUT_MMS_CYL,
+    ny=None,
+    Bz0=0.1,
+    Bzprime=0.1,
+    Rc=1.5,
+    seed=5678,
+    dirichlet_walls=False,
+)
+
+
+class ShearedCylinderField(MagneticField):
+    """Field of :data:`BOUT_MMS_CYL_SHEARED` (cylindrical, y = toroidal angle):
+    ``B_R = 0``, ``B_phi = 1/R``, ``B_Z = Bz0 + Bzprime (R - Rc)``."""
+
+    def __init__(self, Bz0=0.1, Bzprime=0.1, Rc=1.5):
+        self.Bz0, self.Bzprime, self.Rc = float(Bz0), float(Bzprime), float(Rc)
+        self.attributes = {}
+
+    def Bxfunc(self, x, z, phi):
+        return np.zeros(np.shape(x))
+
+    def Byfunc(self, x, z, phi):
+        return 1.0 / np.asarray(x, dtype=float)
+
+    def Bzfunc(self, x, z, phi):
+        return self.Bz0 + self.Bzprime * (np.asarray(x, dtype=float) - self.Rc)
+
+    def Rfunc(self, x, z, phi):
+        return np.asarray(x, dtype=float)
+
 
 def make_test_grid(family, n, filename=None, **kwargs):
     """Shared entry point for test grids (used by BOUT-dev and Hermes-3).
 
-    Families: ``"bout_mms"`` (MMS-spatial-fci-unstructured, Slab field) and
-    ``"bout_mms_cyl"`` (cylindrical case of that test). Other families are
-    built by the callers with :func:`make_unstructured_grid`.
+    Families: ``"bout_mms"`` (MMS-spatial-fci-unstructured, Slab field),
+    ``"bout_mms_cyl"`` (cylindrical case of that test, toroidal field) and
+    ``"bout_mms_cyl_sheared"`` (cylindrical, sheared field, ``n`` planes; for
+    the parallel operators). Other families are built by the callers with
+    :func:`make_unstructured_grid`.
     """
+    if family == "bout_mms_cyl_sheared":
+        p = dict(BOUT_MMS_CYL_SHEARED, **kwargs)
+        pol = UnstructuredPoloidalGrid.slab(
+            n + 1,
+            n,
+            p["Lx"],
+            p["Lz"],
+            R0=p["R0"],
+            Z0=0.0,
+            jitter=p["jitter"],
+            jitter_dirs="rz",
+            periodic_R=False,
+            periodic_Z=True,
+            seed=p["seed"] + n,
+            r_on_walls=True,
+        )
+        field = ShearedCylinderField(p["Bz0"], p["Bzprime"], p["Rc"])
+        return make_unstructured_grid(
+            filename,
+            pol,
+            field,
+            ny=p["ny"] or n,
+            Ly=2.0 * np.pi,
+            yperiodic=True,
+            dirichlet_walls=p["dirichlet_walls"],
+        )
     if family == "bout_mms_cyl":
         from .field import Screwpinch
 
@@ -2111,6 +2178,8 @@ def make_test_grid(family, n, filename=None, **kwargs):
 __all__ = [
     "BOUT_MMS",
     "BOUT_MMS_CYL",
+    "BOUT_MMS_CYL_SHEARED",
+    "ShearedCylinderField",
     "StencilFallbackWarning",
     "UnstructuredGrid",
     "UnstructuredPoloidalGrid",
