@@ -286,6 +286,8 @@ class UnstructuredPoloidalGrid:
             h_Z = h if h_Z is None else h_Z
         self.h = np.array([float(h_R), float(h_Z)])
         self.walls = None
+        self.centroid_dofs = False
+        self._dof = None
         if walls is not None:
             self.walls = tuple(np.asarray(w, dtype=int).ravel() for w in walls)
         self._faces = None
@@ -313,8 +315,9 @@ class UnstructuredPoloidalGrid:
         n_inner=None,
         n_nodes=None,
         seed=0,
-        relax=True,
+        relax=False,
         morton=True,
+        centroid_dofs=True,
     ):
         """Mesh a disc or annulus with gmsh (Delaunay triangulation).
 
@@ -339,9 +342,14 @@ class UnstructuredPoloidalGrid:
             Unused by gmsh's deterministic Delaunay mesher; kept for API
             symmetry with :meth:`slab`
         relax : bool
-            Apply :meth:`centroidal_relax` (wall nodes stay fixed)
+            Apply :meth:`centroidal_relax` (wall nodes stay fixed). Not
+            needed with ``centroid_dofs``
         morton : bool
             Sort the interior nodes in Morton order
+        centroid_dofs : bool
+            Place the unknowns at the dual-cell centroids
+            (:meth:`use_centroid_dofs`), which gives second-order
+            truncation error on the unrelaxed gmsh mesh
 
         The nodes are ordered inner wall, interior, outer wall, and
         ``walls`` is set accordingly. gmsh is imported only here.
@@ -397,6 +405,8 @@ class UnstructuredPoloidalGrid:
         )
         if relax:
             grid.centroidal_relax(omega=1.5)
+        if centroid_dofs:
+            grid.use_centroid_dofs()
         return grid
 
     @classmethod
@@ -502,6 +512,43 @@ class UnstructuredPoloidalGrid:
     def points(self):
         return np.column_stack((self.R, self.Z))
 
+    @property
+    def dof(self):
+        """Positions of the unknowns, shape ``(n_nodes, 2)``: the mesh nodes,
+        or with :meth:`use_centroid_dofs` the centroids of their dual cells
+        (wall nodes stay on the wall)."""
+        if not self.centroid_dofs:
+            return self.points
+        if self._dof is None:
+            offset = self.dual_centroid_offsets()
+            if self.walls is not None:
+                offset[np.concatenate(self.walls)] = 0.0
+            self._dof = self.wrap(self.points + offset)
+        return self._dof
+
+    def use_centroid_dofs(self, enable=True):
+        """Place the unknowns at the centroids of their dual cells.
+
+        Node-centred finite volumes give the average of the divergence over
+        each dual cell, which is a second-order approximation at the cell
+        centroid but only first order at the node when the node is offset
+        from the centroid by O(h), as on any unrelaxed mesh (e.g. gmsh).
+        With centroid unknowns the dual cells of the triangulation are kept
+        unchanged (cell-centred finite volumes on the dual mesh, so the
+        scheme stays conservative); the least-squares stencils, the
+        two-point stabilisation, the field-line start points, the metric and
+        the written ``R``, ``Z`` all use the centroids. This makes
+        :meth:`centroidal_relax` unnecessary. Marked wall nodes (Dirichlet
+        nodes) stay on the wall.
+        """
+        self.centroid_dofs = bool(enable)
+        self._dof = None
+        self._kdtree = None
+        for attr in ("_centroid_tree", "_centroids"):
+            if hasattr(self, attr):
+                delattr(self, attr)
+        return self
+
     def minimum_image(self, d):
         """Wrap displacement vectors ``d[..., 2]`` into the periodic box."""
         d = np.array(d, dtype=float, copy=True)
@@ -602,6 +649,7 @@ class UnstructuredPoloidalGrid:
     def _invalidate(self):
         self._faces = None
         self._kdtree = None
+        self._dof = None
         for attr in ("_centroid_tree", "_centroids"):
             if hasattr(self, attr):
                 delattr(self, attr)
@@ -720,7 +768,7 @@ class UnstructuredPoloidalGrid:
         periodic KD-tree behave as non-periodic in that direction.
         """
         if self._kdtree is None:
-            scaled = (self.points - self.origin) / self.h
+            scaled = (self.dof - self.origin) / self.h
             self._tree_shift = np.zeros(2)
             box = np.zeros(2)
             for dim in range(2):
@@ -732,7 +780,7 @@ class UnstructuredPoloidalGrid:
                     self._tree_shift[dim] = scaled[:, dim].min() - span - 1.0
                     box[dim] = 3.0 * span + 3.0
             self._tree_box = box
-            self._kdtree = KDTree(self._scaled(self.points), boxsize=box)
+            self._kdtree = KDTree(self._scaled(self.dof), boxsize=box)
         return self._kdtree
 
     def _scaled(self, pos):
@@ -756,11 +804,15 @@ class UnstructuredPoloidalGrid:
         max_cond=1e8,
         strict=False,
         weight_power=0.0,
+        eval_offsets=None,
     ):
         """Least-squares value (and gradient) weights at target points.
 
-        Returns ``(inds, w_value[, w_dR, w_dZ], info)``, each of shape
-        ``(m, k)``, with ``k = num_coefs(order) + extra``. ``info`` contains
+        Returns ``(inds, w_value[, w_dR, w_dZ][, w_eval], info)``, each of shape
+        ``(m, k)``, with ``k = num_coefs(order) + extra``. With
+        ``eval_offsets`` (shape ``(m, q, 2)``, physical offsets from each
+        target), ``w_eval`` (shape ``(m, q, k)``) evaluates the same fitted
+        polynomial at ``target + offset``. ``info`` contains
         ``fallback`` (number of points that dropped to a lower order) and
         ``snapped`` (number of injections). Value weights are exact for
         polynomials of total degree <= order.
@@ -780,7 +832,7 @@ class UnstructuredPoloidalGrid:
         tree = self._tree()
         _, inds_all = tree.query(self._scaled(targets), k=kmax)
         inds_all = np.atleast_2d(inds_all)
-        offsets = self.minimum_image(self.points[inds_all] - targets[:, None, :])
+        offsets = self.minimum_image(self.dof[inds_all] - targets[:, None, :])
         u_all = offsets[..., 0] / self.h[0]
         v_all = offsets[..., 1] / self.h[1]
 
@@ -788,6 +840,9 @@ class UnstructuredPoloidalGrid:
         w_val = np.zeros((m, kmax))
         w_dR = np.zeros((m, kmax))
         w_dZ = np.zeros((m, kmax))
+        if eval_offsets is not None:
+            eval_offsets = np.asarray(eval_offsets, dtype=float)
+            w_eval = np.zeros((m, eval_offsets.shape[1], kmax))
         done = np.zeros(m, dtype=bool)
         fallback = 0
         attempts = [(p, kk) for p in range(order, 0, -1) for kk in k_list]
@@ -822,6 +877,10 @@ class UnstructuredPoloidalGrid:
             w_val[idx, :kk] = P[:, 0, :]
             w_dR[idx, :kk] = P[:, 1, :] / self.h[0]
             w_dZ[idx, :kk] = P[:, 2, :] / self.h[1]
+            if eval_offsets is not None:
+                off = eval_offsets[idx]
+                mono = _monomials(off[..., 0] / self.h[0], off[..., 1] / self.h[1], p)
+                w_eval[idx, :, :kk] = mono @ P
             done[idx] = True
             if p < order:
                 fallback += len(idx)
@@ -840,9 +899,12 @@ class UnstructuredPoloidalGrid:
             w_val[snapped] = 0.0
             w_val[snapped, 0] = 1.0
         info = {"fallback": fallback, "snapped": int(np.sum(snapped))}
+        out = (inds, w_val)
         if gradient:
-            return inds, w_val, w_dR, w_dZ, info
-        return inds, w_val, info
+            out += (w_dR, w_dZ)
+        if eval_offsets is not None:
+            out += (w_eval,)
+        return out + (info,)
 
     def in_domain(self, pos, tol=1e-9):
         """True where positions lie inside the meshed domain, or within
@@ -1049,7 +1111,10 @@ def trace_maps(grid, field, rtol=1e-10, field_tracer=None, domain_tol=1e-9):
             y1 = y0 + sign * dy[j]
             traced = np.array(
                 tracer.follow_field_lines(
-                    pol.R, pol.Z, [y0, y0 + 0.5 * sign * dy[j], y1], rtol=rtol
+                    pol.dof[:, 0],
+                    pol.dof[:, 1],
+                    [y0, y0 + 0.5 * sign * dy[j], y1],
+                    rtol=rtol,
                 )
             )
             Rh[j], Zh[j] = traced[1, :, 0], traced[1, :, 1]
@@ -1226,6 +1291,7 @@ def _plane_dagp(
     max_stabilisation=8.0,
     stability_tol=1e-10,
     cylindrical=False,
+    stabilisation_form="polynomial",
 ):
     """Per-plane CSR blocks (local node / face-point numbering).
 
@@ -1306,22 +1372,45 @@ def _plane_dagp(
         fj = np.repeat(f["j"], nq)
         # Face-point positions relative to node i, and x_j - x_i (for flows)
         edge = pol.minimum_image(pol.points[f["j"]] - xi)
-        # Least-squares gradients at the nodes (for upwind reconstruction)
-        n_inds, _, n_dR, n_dZ, n_info = pol.lsq_weights(pol.points, **lsq)
+        # Least-squares gradients at the unknowns (for upwind reconstruction)
+        n_inds, _, n_dR, n_dZ, n_info = pol.lsq_weights(pol.dof, **lsq)
         pos_i = (s[:, None, :] + tq[None, :, None] * d[:, None, :]).reshape(-1, 2)
         edge_fp = np.repeat(edge, nq, axis=0)
+        if pol.centroid_dofs:
+            # Unknowns at the dual-cell centroids: the two-point
+            # stabilisation connects the unknowns, and reconstructions start
+            # from them. shift = node - unknown (relative positions)
+            dof = pol.dof
+            shift = pol.minimum_image(pol.points - dof)
+            edge_s = pol.minimum_image(dof[f["j"]] - dof[f["i"]])
+            mid_s = pol.wrap(dof[f["i"]] + 0.5 * edge_s)
+        else:
+            shift = None
+            edge_s = edge
+            mid_s = None
         fallback = info["fallback"] + n_info["fallback"]
         beta = 0.0
         max_re = None
 
         if stabilisation:
-            mid = pol.wrap(xi + 0.5 * edge)
-            m_inds, m_val, m_dR, m_dZ, m_info = pol.lsq_weights(mid, **lsq)
-            fallback += m_info["fallback"]
-            c = np.sum(normal**2, axis=1) / np.sum(edge * normal, axis=1)
+            mid = pol.wrap(xi + 0.5 * edge) if mid_s is None else mid_s
+            c = np.sum(normal**2, axis=1) / np.sum(edge_s * normal, axis=1)
             if cylindrical:
                 c = c * mid[:, 0]
-            m_grad = -c[:, None] * (edge[:, :1] * m_dR + edge[:, 1:] * m_dZ)
+            if stabilisation_form == "polynomial":
+                # Prediction P(x_j) - P(x_i) of the order-p fit around the
+                # midpoint: the bracket is O(h^(p+1))
+                half = 0.5 * edge_s[:, None, :]
+                m_inds, m_val, m_dR, m_dZ, m_eval, m_info = pol.lsq_weights(
+                    mid, eval_offsets=np.concatenate([-half, half], axis=1), **lsq
+                )
+                m_grad = -c[:, None] * (m_eval[:, 1, :] - m_eval[:, 0, :])
+            elif stabilisation_form == "midpoint":
+                m_inds, m_val, m_dR, m_dZ, m_info = pol.lsq_weights(mid, **lsq)
+                m_grad = -c[:, None] * (edge_s[:, :1] * m_dR + edge_s[:, 1:] * m_dZ)
+            else:
+                raise ValueError(f"Unknown stabilisation_form '{stabilisation_form}'")
+            fallback += m_info["fallback"]
             # Append the two-point difference as two extra columns
             k = max(inds.shape[1], m_inds.shape[1]) + 2
 
@@ -1342,7 +1431,10 @@ def _plane_dagp(
             w_val = np.vstack([pad(w_val, k, 0.0), s_val])
             fi = np.concatenate([fi, f["i"]])
             fj = np.concatenate([fj, f["j"]])
-            pos_i = np.vstack([pos_i, 0.5 * edge])
+            if shift is None:
+                pos_i = np.vstack([pos_i, 0.5 * edge])
+            else:
+                pos_i = np.vstack([pos_i, 0.5 * edge_s - shift[f["i"]]])
             edge_fp = np.vstack([edge_fp, edge])
 
             n, nfp = pol.n_nodes, len(fi)
@@ -1388,8 +1480,13 @@ def _plane_dagp(
         assert cols.shape[1] == k + 1
         return cols, w
 
-    left_inds, left_w = reconstruction(fi, pos_i)
-    right_inds, right_w = reconstruction(fj, pos_i - edge_fp)
+    if shift is None:
+        left_inds, left_w = reconstruction(fi, pos_i)
+        right_inds, right_w = reconstruction(fj, pos_i - edge_fp)
+    else:
+        # Offsets from the unknowns rather than the nodes
+        left_inds, left_w = reconstruction(fi, pos_i + shift[fi])
+        right_inds, right_w = reconstruction(fj, pos_i - edge_fp + shift[fj])
     return {
         "n_fp": len(fi),
         "inds": inds,
@@ -1571,7 +1668,7 @@ def slab_metric(grid, field, maps, volume):
     By = np.zeros((ny, n))
     for j in range(ny):
         pol = grid.plane(j)
-        Bmag[j], By[j] = bfield(pol.R, pol.Z, grid.ycoords[j])
+        Bmag[j], By[j] = bfield(pol.dof[:, 0], pol.dof[:, 1], grid.ycoords[j])
 
     ones = np.ones(shape)
     zeros = np.zeros(shape)
@@ -1603,7 +1700,12 @@ def slab_metric(grid, field, maps, volume):
     # dagp_us_volume.
     metric["dx"] = ones.copy()
     metric["By"] = grid.to3d(
-        By * (np.array([grid.plane(j).R for j in range(ny)]) if cylindrical else 1.0)
+        By
+        * (
+            np.array([grid.plane(j).dof[:, 0] for j in range(ny)])
+            if cylindrical
+            else 1.0
+        )
     )
 
     # Staggered (half-step) quantities, as written by zoidberg.make_maps
@@ -1694,8 +1796,9 @@ def build_grid_data(
     data.update(som)
     data.update(dagp)
 
-    R = np.array([grid.plane(j).R for j in range(grid.ny)])
-    Z = np.array([grid.plane(j).Z for j in range(grid.ny)])
+    # Positions of the unknowns (the nodes, or the dual-cell centroids)
+    R = np.array([grid.plane(j).dof[:, 0] for j in range(grid.ny)])
+    Z = np.array([grid.plane(j).dof[:, 1] for j in range(grid.ny)])
     data["R"] = grid.to3d(R)
     data["Z"] = grid.to3d(Z)
     data["Rxy"] = data["R"]
@@ -1782,7 +1885,14 @@ def make_unstructured_grid(
     return grid, data, stats
 
 
-def gmsh_planes(outers, inners=None, mesh_size=None, relax=True, multiple_of=4):
+def gmsh_planes(
+    outers,
+    inners=None,
+    mesh_size=None,
+    relax=False,
+    multiple_of=4,
+    centroid_dofs=True,
+):
     """Mesh every poloidal cross-section independently with gmsh.
 
     ``outers[j]`` (and ``inners[j]``, or ``None`` for discs) are the closed
@@ -1792,7 +1902,8 @@ def gmsh_planes(outers, inners=None, mesh_size=None, relax=True, multiple_of=4):
     longest curve of all planes; the planes are meshed, and those with fewer
     nodes than the largest are re-meshed with the missing nodes added in
     their largest triangles. The total is rounded up so that the number of
-    evolving (non-wall) nodes is a multiple of ``multiple_of``.
+    evolving (non-wall) nodes is a multiple of ``multiple_of``. ``relax``
+    and ``centroid_dofs``: see :meth:`UnstructuredPoloidalGrid.from_gmsh`.
     """
     ny = len(outers)
     if inners is None:
@@ -1802,6 +1913,7 @@ def gmsh_planes(outers, inners=None, mesh_size=None, relax=True, multiple_of=4):
     if inners[0] is not None:
         n_inner = int(np.ceil(max(_curve_length(c) for c in inners) / mesh_size))
     kw = {"mesh_size": mesh_size, "n_outer": n_outer, "n_inner": n_inner}
+    kw["centroid_dofs"] = False  # set after relaxing
     planes = [
         UnstructuredPoloidalGrid.from_gmsh(o, i, relax=False, **kw)
         for o, i in zip(outers, inners)
@@ -1815,9 +1927,11 @@ def gmsh_planes(outers, inners=None, mesh_size=None, relax=True, multiple_of=4):
         else UnstructuredPoloidalGrid.from_gmsh(o, i, n_nodes=target, relax=False, **kw)
         for p, o, i in zip(planes, outers, inners)
     ]
-    if relax:
-        for p in planes:
+    for p in planes:
+        if relax:
             p.centroidal_relax(omega=1.5)
+        if centroid_dofs:
+            p.use_centroid_dofs()
     return planes
 
 

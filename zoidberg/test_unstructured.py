@@ -498,11 +498,14 @@ def test_gmsh_curved_walls_order():
         # Inner-wall nodes on the inner (elliptic) wall curve
         r_in = np.hypot((pol.R[w_in] - 2.05) / 0.15, (pol.Z[w_in] - 0.02) / 0.12)
         assert np.allclose(r_in, 1.0, atol=1e-4)
-        unrelaxed = us.UnstructuredPoloidalGrid.from_gmsh(
-            outer, inner, mesh_size=h, relax=False
+        relaxed = us.UnstructuredPoloidalGrid.from_gmsh(
+            outer, inner, mesh_size=h, relax=True
         )
         walls = np.concatenate(pol.walls)
-        assert np.array_equal(pol.points[walls], unrelaxed.points[walls])
+        assert np.array_equal(pol.points[walls], relaxed.points[walls])
+        # Unknowns at the dual-cell centroids, wall nodes on the wall
+        assert pol.centroid_dofs
+        assert np.array_equal(pol.dof[walls], pol.points[walls])
         grid = us.UnstructuredGrid(
             pol, np.array([0.0]), 1.0, dirichlet_walls=True, multiple_of=1
         )
@@ -531,10 +534,12 @@ def test_gmsh_curved_walls_order():
         )
         node_cells = cn[grid.node_x]
         k = 2 * np.pi
+        R, Z = pol.dof[:, 0], pol.dof[:, 1]
+        assert np.array_equal(data["R"][grid.node_x, 0, 0], R)
         f = np.zeros(nc)
-        f[node_cells] = np.sin(k * pol.R) * np.cos(k * pol.Z)
+        f[node_cells] = np.sin(k * R) * np.cos(k * Z)
         res = (D @ (V @ np.ones(nc) * (G @ f)))[node_cells]
-        ex = -2 * k * k * np.sin(k * pol.R) * np.cos(k * pol.Z)
+        ex = -2 * k * k * np.sin(k * R) * np.cos(k * Z)
         assert np.all(res[~grid.interior] == 0.0)
         e = (res - ex)[grid.interior]
         errs.append(np.sqrt(np.mean(e**2)))
@@ -557,3 +562,73 @@ def test_gmsh_planes_equal_counts():
     for p in planes:
         assert np.all(p.dual_volumes() > 0)
         p._check_orientation()
+
+
+def _plane_laplacian_error(pol):
+    from scipy.sparse import csr_matrix
+
+    blk = us._plane_dagp(pol, order=4)
+    n, nfp = pol.n_nodes, blk["n_fp"]
+    rows = np.repeat(np.arange(nfp), blk["inds"].shape[1])
+    G = csr_matrix((blk["w_grad"].ravel(), (rows, blk["inds"].ravel())), shape=(nfp, n))
+    D = csr_matrix(
+        (
+            np.concatenate([1 / blk["vol"][blk["fi"]], -1 / blk["vol"][blk["fj"]]]),
+            (np.concatenate([blk["fi"], blk["fj"]]), np.tile(np.arange(nfp), 2)),
+        ),
+        shape=(n, nfp),
+    )
+    R, Z = pol.dof[:, 0], pol.dof[:, 1]
+    k = 2 * np.pi
+    res = D @ (G @ (np.sin(k * R) * np.cos(k * Z)))
+    ex = -2 * k * k * np.sin(k * R) * np.cos(k * Z)
+    assert blk["max_re"] <= 1e-10
+    return np.sqrt(np.mean((res - ex) ** 2))
+
+
+def test_centroid_dofs_unrelaxed_order():
+    # On an unrelaxed irregular mesh node unknowns give a first-order
+    # truncation error; unknowns at the dual-cell centroids give second order
+    def mesh(n, centroid):
+        pol = us.UnstructuredPoloidalGrid.slab(
+            n,
+            n,
+            1.0,
+            1.0,
+            jitter=0.2,
+            jitter_dirs="rz",
+            periodic_R=True,
+            periodic_Z=True,
+            seed=5 + n,
+            relax=False,
+        )
+        return pol.use_centroid_dofs(centroid)
+
+    ns = (24, 48)
+    for centroid, lo, hi in ((True, 1.9, 3.0), (False, 0.5, 1.5)):
+        errs = [_plane_laplacian_error(mesh(n, centroid)) for n in ns]
+        order = np.log2(errs[0] / errs[1])
+        assert lo < order < hi, (centroid, errs)
+    pol = mesh(24, True)
+    offsets = pol.dual_centroid_offsets()
+    assert np.max(np.abs(offsets)) > 0.01 * pol.h[0]  # really unrelaxed
+    assert np.allclose(pol.dof, pol.wrap(pol.points + offsets))
+
+
+def test_lsq_eval_offsets_exact():
+    # Polynomial evaluation weights reproduce polynomials of the fit order
+    pol = us.UnstructuredPoloidalGrid.slab(
+        12, 12, 1.0, 1.0, jitter=0.2, jitter_dirs="rz", periodic_R=False, seed=3
+    )
+    rng = np.random.default_rng(1)
+    targets = np.column_stack((rng.uniform(0.3, 0.7, 20), rng.uniform(0.3, 0.7, 20)))
+    offsets = rng.uniform(-0.05, 0.05, (20, 2, 2))
+    inds, _, w_eval, _ = pol.lsq_weights(targets, order=4, eval_offsets=offsets)
+
+    def poly(R, Z):
+        return 1 + R - 2 * Z + R**2 * Z - 3 * Z**4 + R**3 * Z
+
+    vals = poly(pol.R, pol.Z)[inds]
+    got = np.einsum("mqk,mk->mq", w_eval, vals)
+    pts = targets[:, None, :] + offsets
+    assert np.allclose(got, poly(pts[..., 0], pts[..., 1]), atol=1e-10)
