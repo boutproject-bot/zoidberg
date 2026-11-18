@@ -22,14 +22,26 @@ Layout ("nodes along x")
     interior. Nodes are sorted in Morton (Z-order) to improve locality.
 
 Dirichlet walls (optional, ``dirichlet_walls=True``)
-    For domains that are not periodic in R, the nodes on the two R walls are
-    stored in the x guard cells instead: inner-wall nodes at
-    ``x = 0 .. n_inner-1``, outer-wall nodes at the end, and
-    ``MXG = max(n_inner, n_outer)``. They have ``cell_number >= 0`` (the
-    x-boundary cells of the cell space), no divergence row and no parallel
-    legs. BOUT++ does not evolve them; set them with the ``dirichlet_node``
-    boundary condition, which evaluates the boundary value at each guard
-    cell. ``n_nodes`` then counts all nodes, and ``nx = n_evolving + 2*MXG``.
+    The wall nodes are stored in the x guard cells instead: inner-wall nodes
+    at ``x = 0 .. n_inner-1``, outer-wall nodes at the end, and
+    ``MXG = max(n_inner, n_outer)``. The walls are the planes' marked
+    ``walls`` (any shape; e.g. the flux surfaces or the boundary loops of a
+    gmsh mesh, see :meth:`UnstructuredPoloidalGrid.from_gmsh`), or, for
+    unmarked meshes not periodic in R, the lines of minimum and maximum R.
+    Wall nodes have ``cell_number >= 0`` (the x-boundary cells of the cell
+    space), no divergence row and no parallel legs. BOUT++ does not evolve
+    them; set them with the ``dirichlet_node`` boundary condition, which
+    evaluates the boundary value at each guard cell. ``n_nodes`` then counts
+    all nodes, and ``nx = n_evolving + 2*MXG``. Because BOUT++ exchanges
+    ``MXG`` x guard cells between processors, ``NXPE > 1`` needs at least
+    ``MXG`` evolving nodes per processor (BOUT++ checks this at start-up).
+
+Meshing
+    :meth:`UnstructuredPoloidalGrid.from_gmsh` meshes a disc or annulus with
+    gmsh; :func:`gmsh_planes` meshes every poloidal cross-section
+    independently and equalises the node counts that the layout requires
+    (same number of nodes and of wall nodes in every plane). gmsh is only
+    imported there.
 
 Flag
     ``unstructured = 1`` (int).
@@ -150,6 +162,73 @@ def _morton_order(R, Z, bits=16):
     return np.argsort(key, kind="stable")
 
 
+def _curve_length(c):
+    """Length of the closed polygon through the points ``c[:, 2]``."""
+    d = np.diff(np.vstack([c, c[:1]]), axis=0)
+    return float(np.sum(np.hypot(d[:, 0], d[:, 1])))
+
+
+def _gmsh_mesh(loops, counts, mesh_size, embed=None):
+    """Triangulate the region bounded by closed curves with gmsh.
+
+    ``loops[0]`` is the outer boundary, further loops are holes; each is a
+    closed spline with ``counts[i]`` equally spaced nodes (transfinite). With
+    ``embed``, these interior points are fixed mesh nodes and no other
+    interior nodes are inserted. Returns ``(points, triangles,
+    wall_nodes)``, where ``wall_nodes[i]`` are the nodes on ``loops[i]``.
+    """
+    import gmsh
+
+    gmsh.initialize(interruptible=False)
+    try:
+        gmsh.option.setNumber("General.Terminal", 0)
+        gmsh.model.add("plane")
+        geo = gmsh.model.geo
+        curves, curve_loops = [], []
+        for pts, n in zip(loops, counts):
+            tags = [geo.addPoint(r, z, 0.0, mesh_size) for r, z in pts]
+            spline = geo.addSpline(tags + [tags[0]])
+            geo.mesh.setTransfiniteCurve(spline, n + 1)
+            curves.append(spline)
+            curve_loops.append(geo.addCurveLoop([spline]))
+        surface = geo.addPlaneSurface(curve_loops)
+        embedded = []
+        if embed is not None:
+            embedded = [geo.addPoint(r, z, 0.0, mesh_size) for r, z in embed]
+        geo.synchronize()
+        if embedded:
+            gmsh.model.mesh.embed(0, embedded, 2, surface)
+            # Only the embedded points: no size-driven node insertion
+            gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 0)
+            gmsh.option.setNumber("Mesh.MeshSizeFromPoints", 0)
+            gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
+            big = 10.0 * max(np.ptp(np.vstack(loops), axis=0))
+            gmsh.option.setNumber("Mesh.MeshSizeMin", big)
+            gmsh.option.setNumber("Mesh.MeshSizeMax", big)
+        gmsh.option.setNumber("Mesh.Algorithm", 5)  # Delaunay
+        gmsh.model.mesh.generate(2)
+        _, conn = gmsh.model.mesh.getElementsByType(2, surface)
+        tags, coords, _ = gmsh.model.mesh.getNodes()
+        wall_tags = [
+            gmsh.model.mesh.getNodes(1, c, includeBoundary=True)[0] for c in curves
+        ]
+    finally:
+        gmsh.finalize()
+    conn = conn.reshape(-1, 3)
+    # Keep the nodes used by triangles (spline control points are not)
+    used = np.unique(conn)
+    pos = dict(zip(tags, coords.reshape(-1, 3)[:, :2]))
+    points = np.array([pos[t] for t in used])
+    index = np.searchsorted(used, conn)
+    walls = [
+        np.unique(np.searchsorted(used, np.intersect1d(w, used))) for w in wall_tags
+    ]
+    for w, n in zip(walls, counts):
+        if len(w) != n:
+            raise RuntimeError(f"Wall has {len(w)} nodes, expected {n}")
+    return points, index, walls
+
+
 class UnstructuredPoloidalGrid:
     """A triangulated poloidal plane.
 
@@ -167,6 +246,14 @@ class UnstructuredPoloidalGrid:
         ``sqrt(area / n_nodes)`` in both directions
     origin : (float, float), optional
         Lower-left corner of the periodic box (only used for wrapping)
+    walls : (array_like, array_like), optional
+        Node indices on the inner and outer wall of a non-periodic domain
+        (either may be empty). Used for Dirichlet wall nodes
+        (``UnstructuredGrid(dirichlet_walls=True)``), to classify field lines
+        that leave the domain, and to keep wall nodes fixed during
+        :meth:`centroidal_relax`. ``None`` (default): for meshes from
+        :meth:`slab`, the walls are the lines of minimum and maximum R.
+        See :meth:`from_structured` and :meth:`mark_boundary_walls`.
     """
 
     def __init__(
@@ -179,6 +266,7 @@ class UnstructuredPoloidalGrid:
         h_R=None,
         h_Z=None,
         origin=(0.0, 0.0),
+        walls=None,
     ):
         self.R = np.asarray(R, dtype=float)
         self.Z = np.asarray(Z, dtype=float)
@@ -197,6 +285,9 @@ class UnstructuredPoloidalGrid:
             h_R = h if h_R is None else h_R
             h_Z = h if h_Z is None else h_Z
         self.h = np.array([float(h_R), float(h_Z)])
+        self.walls = None
+        if walls is not None:
+            self.walls = tuple(np.asarray(w, dtype=int).ravel() for w in walls)
         self._faces = None
         self._kdtree = None
 
@@ -211,6 +302,102 @@ class UnstructuredPoloidalGrid:
         mesh = meshio.read(path)
         tri = mesh.cells_dict["triangle"]
         return cls(mesh.points[:, 0], mesh.points[:, 1], tri, **kwargs)
+
+    @classmethod
+    def from_gmsh(
+        cls,
+        outer,
+        inner=None,
+        mesh_size=None,
+        n_outer=None,
+        n_inner=None,
+        n_nodes=None,
+        seed=0,
+        relax=True,
+        morton=True,
+    ):
+        """Mesh a disc or annulus with gmsh (Delaunay triangulation).
+
+        Parameters
+        ----------
+        outer, inner : array_like
+            Closed wall curves, shape ``(n, 2)`` (R, Z) without repeating the
+            first point. Each is meshed as a closed spline through these
+            points. ``inner=None`` gives a disc.
+        mesh_size : float
+            Target triangle edge length
+        n_outer, n_inner : int, optional
+            Number of nodes on each wall (default: curve length/mesh_size).
+            Fix these to give several planes the same wall-node counts.
+        n_nodes : int, optional
+            Required total number of nodes. If gmsh gives fewer, the missing
+            nodes are added at the centroids of the largest triangles and the
+            domain is re-triangulated by gmsh with all nodes fixed. More
+            nodes than ``n_nodes`` is an error (use :func:`gmsh_planes`,
+            which takes the largest count of all planes).
+        seed : int
+            Unused by gmsh's deterministic Delaunay mesher; kept for API
+            symmetry with :meth:`slab`
+        relax : bool
+            Apply :meth:`centroidal_relax` (wall nodes stay fixed)
+        morton : bool
+            Sort the interior nodes in Morton order
+
+        The nodes are ordered inner wall, interior, outer wall, and
+        ``walls`` is set accordingly. gmsh is imported only here.
+        """
+        del seed
+        outer = np.asarray(outer, dtype=float)
+        loops = [outer] if inner is None else [outer, np.asarray(inner, dtype=float)]
+        if mesh_size is None:
+            raise ValueError("mesh_size is required")
+        counts = [n_outer, n_inner][: len(loops)]
+        counts = [
+            int(np.ceil(_curve_length(c) / mesh_size)) if n is None else int(n)
+            for c, n in zip(loops, counts)
+        ]
+        pts, tri, wall_nodes = _gmsh_mesh(loops, counts, mesh_size)
+        if n_nodes is not None and len(pts) != n_nodes:
+            if len(pts) > n_nodes:
+                raise ValueError(
+                    f"gmsh produced {len(pts)} nodes, more than n_nodes = {n_nodes}"
+                )
+            on_wall = np.zeros(len(pts), dtype=bool)
+            on_wall[np.concatenate(wall_nodes)] = True
+            P = pts[tri]
+            area = 0.5 * np.abs(
+                (P[:, 1, 0] - P[:, 0, 0]) * (P[:, 2, 1] - P[:, 0, 1])
+                - (P[:, 2, 0] - P[:, 0, 0]) * (P[:, 1, 1] - P[:, 0, 1])
+            )
+            largest = np.argsort(area, kind="stable")[::-1][: n_nodes - len(pts)]
+            embed = np.vstack([pts[~on_wall], P[largest].mean(axis=1)])
+            pts, tri, wall_nodes = _gmsh_mesh(loops, counts, mesh_size, embed=embed)
+            if len(pts) != n_nodes:
+                raise RuntimeError(
+                    f"gmsh re-triangulation gave {len(pts)} nodes, expected {n_nodes}"
+                )
+        # Order: inner wall, interior, outer wall
+        outer_nodes = wall_nodes[0]
+        inner_nodes = wall_nodes[1] if len(wall_nodes) > 1 else np.zeros(0, int)
+        on_wall = np.zeros(len(pts), dtype=bool)
+        on_wall[outer_nodes] = True
+        on_wall[inner_nodes] = True
+        interior = np.flatnonzero(~on_wall)
+        if morton and len(interior):
+            interior = interior[_morton_order(pts[interior, 0], pts[interior, 1])]
+        perm = np.concatenate([inner_nodes, interior, outer_nodes])
+        inverse = np.empty_like(perm)
+        inverse[perm] = np.arange(len(perm))
+        n_in, n_out = len(inner_nodes), len(outer_nodes)
+        grid = cls(
+            pts[perm, 0],
+            pts[perm, 1],
+            inverse[tri],
+            walls=(np.arange(n_in), np.arange(len(perm) - n_out, len(perm))),
+        )
+        if relax:
+            grid.centroidal_relax(omega=1.5)
+        return grid
 
     @classmethod
     def slab(
@@ -443,8 +630,9 @@ class UnstructuredPoloidalGrid:
         Node-centred finite volumes have an O(h) pointwise truncation error
         when nodes are offset from their control-volume centroids, which
         happens on any irregular mesh. After relaxation the offset is below
-        ``tol*h`` in each direction, which restores second order. Nodes on non-periodic walls
-        only move along the wall. Returns the number of iterations.
+        ``tol*h`` in each direction, which restores second order. Nodes on
+        straight non-periodic walls only move along the wall; nodes in
+        ``walls`` do not move. Returns the number of iterations.
         """
         f = self.faces()
         wall = np.zeros((self.n_nodes, 2), dtype=bool)
@@ -460,6 +648,9 @@ class UnstructuredPoloidalGrid:
                 )
                 wall[on_wall, dim] = True
         del bnodes
+        if self.walls is not None:
+            # Marked (possibly curved) walls: their nodes do not move
+            wall[np.concatenate(self.walls)] = True
         for it in range(1, max_iter + 1):
             delta = self.dual_centroid_offsets()
             delta[wall] = 0.0
@@ -732,9 +923,11 @@ class UnstructuredGrid:
         """x index of every node (``node_x``) and which nodes evolve.
 
         Without Dirichlet walls node k is at ``MXG + k``. With
-        ``dirichlet_walls`` the nodes on the walls of a non-periodic R
-        domain go into the x guard cells: inner-wall nodes at the start,
-        outer-wall nodes at the end. ``MXG`` is the larger of the two counts.
+        ``dirichlet_walls`` the wall nodes go into the x guard cells:
+        inner-wall nodes at the start, outer-wall nodes at the end. ``MXG``
+        is the larger of the two counts. The walls are the planes' marked
+        ``walls`` (any shape, e.g. from :meth:`UnstructuredPoloidalGrid.from_gmsh`)
+        or, if unmarked, the lines of minimum and maximum R.
         BOUT++ does not evolve guard cells and sets them with the
         ``dirichlet_node`` boundary condition.
         """
@@ -744,21 +937,33 @@ class UnstructuredGrid:
             self.interior = np.ones(n, dtype=bool)
         else:
             pol = self._planes[0]
-            if np.isfinite(pol.period[0]):
-                raise ValueError(
-                    "dirichlet_walls needs a domain that is not periodic in R"
-                )
-            tol = 1e-9 * np.ptp(pol.R)
-            inner = np.flatnonzero(pol.R <= pol.R.min() + tol)
-            outer = np.flatnonzero(pol.R >= pol.R.max() - tol)
-            for other in self._planes[1:]:
-                if not (
-                    np.array_equal(np.flatnonzero(other.R <= pol.R.min() + tol), inner)
-                    and np.array_equal(
-                        np.flatnonzero(other.R >= pol.R.max() - tol), outer
+            if pol.walls is not None:
+                # Marked walls (e.g. from_gmsh): curved, any shape
+                inner, outer = (np.sort(w) for w in pol.walls)
+                for other in self._planes[1:]:
+                    if other.walls is None or not (
+                        np.array_equal(np.sort(other.walls[0]), inner)
+                        and np.array_equal(np.sort(other.walls[1]), outer)
+                    ):
+                        raise ValueError("All planes must have the same wall nodes")
+            else:
+                if np.isfinite(pol.period[0]):
+                    raise ValueError(
+                        "dirichlet_walls needs a domain that is not periodic in R"
                     )
-                ):
-                    raise ValueError("All planes must have the same wall nodes")
+                tol = 1e-9 * np.ptp(pol.R)
+                inner = np.flatnonzero(pol.R <= pol.R.min() + tol)
+                outer = np.flatnonzero(pol.R >= pol.R.max() - tol)
+                for other in self._planes[1:]:
+                    if not (
+                        np.array_equal(
+                            np.flatnonzero(other.R <= pol.R.min() + tol), inner
+                        )
+                        and np.array_equal(
+                            np.flatnonzero(other.R >= pol.R.max() - tol), outer
+                        )
+                    ):
+                        raise ValueError("All planes must have the same wall nodes")
             self.MXG = max(len(inner), len(outer))
             self.interior = np.ones(n, dtype=bool)
             self.interior[inner] = False
@@ -812,13 +1017,21 @@ class UnstructuredGrid:
 # Field-line maps
 
 
-def trace_maps(grid, field, rtol=1e-10, field_tracer=None):
+def trace_maps(grid, field, rtol=1e-10, field_tracer=None, domain_tol=1e-9):
     """Trace field lines from every node to the neighbouring planes.
 
     Returns a dict with per-plane arrays of shape ``(ny, n_nodes)``:
     ``forward_R``, ``forward_Z``, ``forward_hit`` (0 inside, -1 inner wall,
     +1 outer wall), ``forward_half_R``/``forward_half_Z`` (positions half
     way to the next plane), and the same for ``backward``.
+
+    End points outside the target plane's mesh are wall hits. On planes with
+    marked ``walls`` the hit is on the wall with the nearest wall node,
+    otherwise on the outer wall if R is above the mesh centre. End points
+    within about ``domain_tol`` node spacings outside the mesh count as
+    inside (their stencils extrapolate slightly); this plays the role of
+    the manual correction of ``xt_prime`` next to traced flux-surface walls
+    in structured stellarator grids.
     """
     tracer = field_tracer or fieldtracer.FieldTracer(field)
     ny, n = grid.ny, grid.n_nodes
@@ -850,9 +1063,15 @@ def trace_maps(grid, field, rtol=1e-10, field_tracer=None):
             target = grid.plane(jn % ny)
             pos = target.wrap(end)
             Rp[j], Zp[j] = pos[:, 0], pos[:, 1]
-            inside = target.in_domain(pos)
-            centre = target.points.mean(axis=0)
-            outer = pos[:, 0] >= centre[0]
+            inside = target.in_domain(pos, tol=domain_tol)
+            if target.walls is not None and len(target.walls[1]):
+                w_in, w_out = target.walls
+                wall_nodes = np.concatenate([w_in, w_out])
+                _, near = KDTree(target.points[wall_nodes]).query(pos)
+                outer = near >= len(w_in)
+            else:
+                centre = target.points.mean(axis=0)
+                outer = pos[:, 0] >= centre[0]
             hit[j] = np.where(inside, 0, np.where(outer, 1, -1))
         if grid.walls_y:
             last = ny - 1 if sign > 0 else 0
@@ -1437,7 +1656,14 @@ def slab_metric(grid, field, maps, volume):
 
 
 def build_grid_data(
-    grid, field, map_order=4, dagp_order=4, rule="gauss2", strict=True, rtol=1e-10
+    grid,
+    field,
+    map_order=4,
+    dagp_order=4,
+    rule="gauss2",
+    strict=True,
+    rtol=1e-10,
+    domain_tol=1e-9,
 ):
     """Compute every variable of the grid-file contract. Returns
     ``(data, stats)``.
@@ -1449,9 +1675,9 @@ def build_grid_data(
     ``dagp_order`` is the order of the face gradient/value fits of the
     perpendicular operator (order 4 with the larger stencils of
     :func:`_plane_dagp` gives robust second order and no growing modes on
-    the test grids).
+    the test grids). ``domain_tol``: see :func:`trace_maps`.
     """
-    maps = trace_maps(grid, field, rtol=rtol)
+    maps = trace_maps(grid, field, rtol=rtol, domain_tol=domain_tol)
     som, som_stats = som_weights(grid, maps, order=map_order, strict=strict)
     dagp, dagp_stats = dagp_unstructured(
         grid,
@@ -1525,8 +1751,13 @@ def make_unstructured_grid(
     strict=True,
     multiple_of=4,
     dirichlet_walls=False,
+    domain_tol=1e-9,
 ):
-    """Convenience wrapper: build the 3D grid, compute and write all data."""
+    """Convenience wrapper: build the 3D grid, compute and write all data.
+
+    ``poloidal`` is one :class:`UnstructuredPoloidalGrid` for every plane or
+    a list of ``ny`` of them (e.g. from :func:`gmsh_planes`).
+    """
     ycoords = np.linspace(0.0, Ly, ny, endpoint=False)
     grid = UnstructuredGrid(
         poloidal,
@@ -1544,10 +1775,50 @@ def make_unstructured_grid(
         dagp_order=dagp_order,
         rule=rule,
         strict=strict,
+        domain_tol=domain_tol,
     )
     if filename is not None:
         write_unstructured(filename, grid, data)
     return grid, data, stats
+
+
+def gmsh_planes(outers, inners=None, mesh_size=None, relax=True, multiple_of=4):
+    """Mesh every poloidal cross-section independently with gmsh.
+
+    ``outers[j]`` (and ``inners[j]``, or ``None`` for discs) are the closed
+    wall curves of plane ``j`` (see :meth:`UnstructuredPoloidalGrid.from_gmsh`).
+    The grid format stores nodes along x, so all planes need the same number
+    of nodes and of wall nodes. The wall-node counts are fixed from the
+    longest curve of all planes; the planes are meshed, and those with fewer
+    nodes than the largest are re-meshed with the missing nodes added in
+    their largest triangles. The total is rounded up so that the number of
+    evolving (non-wall) nodes is a multiple of ``multiple_of``.
+    """
+    ny = len(outers)
+    if inners is None:
+        inners = [None] * ny
+    n_outer = int(np.ceil(max(_curve_length(c) for c in outers) / mesh_size))
+    n_inner = None
+    if inners[0] is not None:
+        n_inner = int(np.ceil(max(_curve_length(c) for c in inners) / mesh_size))
+    kw = {"mesh_size": mesh_size, "n_outer": n_outer, "n_inner": n_inner}
+    planes = [
+        UnstructuredPoloidalGrid.from_gmsh(o, i, relax=False, **kw)
+        for o, i in zip(outers, inners)
+    ]
+    n_walls = n_outer + (n_inner or 0)
+    target = max(p.n_nodes for p in planes)
+    target += -(target - n_walls) % multiple_of
+    planes = [
+        p
+        if p.n_nodes == target
+        else UnstructuredPoloidalGrid.from_gmsh(o, i, n_nodes=target, relax=False, **kw)
+        for p, o, i in zip(planes, outers, inners)
+    ]
+    if relax:
+        for p in planes:
+            p.centroidal_relax(omega=1.5)
+    return planes
 
 
 # Parameters of the BOUT-dev MMS-spatial-fci-unstructured test grids. These
@@ -1635,6 +1906,7 @@ __all__ = [
     "UnstructuredPoloidalGrid",
     "build_grid_data",
     "dagp_unstructured",
+    "gmsh_planes",
     "is_cylindrical",
     "make_test_grid",
     "make_unstructured_grid",

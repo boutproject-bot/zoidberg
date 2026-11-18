@@ -467,3 +467,93 @@ def test_cylindrical_operator_and_metric():
         e = (res - ex)[grid.interior]
         errs.append(np.sqrt(np.mean(e**2)))
     assert np.log2(errs[0] / errs[1]) > 1.8, errs
+
+
+def _curved_annulus(shift=0.0, n=200):
+    th = np.linspace(0.0, 2.0 * np.pi, n, endpoint=False)
+    outer = np.column_stack(
+        (2.0 + 0.45 * np.cos(th) + 0.04 * np.cos(3 * th), (0.38 + shift) * np.sin(th))
+    )
+    inner = np.column_stack(
+        (2.05 + shift + 0.15 * np.cos(th), 0.02 + 0.12 * np.sin(th))
+    )
+    return outer, inner
+
+
+def test_gmsh_curved_walls_order():
+    # gmsh annulus with two curved walls: walls ordered inner first, outer
+    # last, unmoved by relaxation, Dirichlet in the guard cells; the operator
+    # is second order on the evolving nodes and has no growing modes
+    pytest.importorskip("gmsh")
+    from scipy.sparse import csr_matrix
+
+    outer, inner = _curved_annulus()
+    errs = []
+    hs = (1 / 12, 1 / 24)
+    for h in hs:
+        pol = us.UnstructuredPoloidalGrid.from_gmsh(outer, inner, mesh_size=h)
+        w_in, w_out = pol.walls
+        assert np.array_equal(w_in, np.arange(len(w_in)))
+        assert np.array_equal(w_out, pol.n_nodes - len(w_out) + np.arange(len(w_out)))
+        # Inner-wall nodes on the inner (elliptic) wall curve
+        r_in = np.hypot((pol.R[w_in] - 2.05) / 0.15, (pol.Z[w_in] - 0.02) / 0.12)
+        assert np.allclose(r_in, 1.0, atol=1e-4)
+        unrelaxed = us.UnstructuredPoloidalGrid.from_gmsh(
+            outer, inner, mesh_size=h, relax=False
+        )
+        walls = np.concatenate(pol.walls)
+        assert np.array_equal(pol.points[walls], unrelaxed.points[walls])
+        grid = us.UnstructuredGrid(
+            pol, np.array([0.0]), 1.0, dirichlet_walls=True, multiple_of=1
+        )
+        assert grid.MXG == max(len(w_in), len(w_out))
+        assert not np.any(grid.interior[walls])
+        data, stats = us.build_grid_data(grid, zbfield.Slab(Bz=0.0, Bzprime=0.0))
+        assert stats["dagp"]["max_re"] <= 1e-10
+        assert stats["dagp"]["fallback"] == 0
+        cn = data["cell_number"][:, 0, 0]
+        nc, nfp = data["total_cells"], data["dagp_us_n_facepoints"]
+
+        def mat(name, shape, data=data):
+            return csr_matrix(
+                (
+                    data[f"dagp_us_{name}_weights"],
+                    data[f"dagp_us_{name}_columns"],
+                    data[f"dagp_us_{name}_rows"],
+                ),
+                shape=shape,
+            )
+
+        G, V, D = (
+            mat("gradp", (nfp, nc)),
+            mat("value", (nfp, nc)),
+            mat("div", (nc, nfp)),
+        )
+        node_cells = cn[grid.node_x]
+        k = 2 * np.pi
+        f = np.zeros(nc)
+        f[node_cells] = np.sin(k * pol.R) * np.cos(k * pol.Z)
+        res = (D @ (V @ np.ones(nc) * (G @ f)))[node_cells]
+        ex = -2 * k * k * np.sin(k * pol.R) * np.cos(k * pol.Z)
+        assert np.all(res[~grid.interior] == 0.0)
+        e = (res - ex)[grid.interior]
+        errs.append(np.sqrt(np.mean(e**2)))
+    assert np.log(errs[0] / errs[1]) / np.log(hs[0] / hs[1]) > 1.8, errs
+
+
+def test_gmsh_planes_equal_counts():
+    # Independently meshed planes of different shape get the same node and
+    # wall-node counts, as the nodes-along-x layout requires
+    pytest.importorskip("gmsh")
+    shapes = [_curved_annulus(shift) for shift in (0.0, 0.03, -0.02)]
+    planes = us.gmsh_planes(
+        [o for o, _ in shapes], [i for _, i in shapes], mesh_size=1 / 16
+    )
+    assert len({p.n_nodes for p in planes}) == 1
+    assert len({tuple(len(w) for w in p.walls) for p in planes}) == 1
+    assert not np.allclose(planes[0].points, planes[1].points)
+    grid = us.UnstructuredGrid(planes, np.arange(3.0), 3.0, dirichlet_walls=True)
+    assert grid.n_interior % 4 == 0
+    for p in planes:
+        assert np.all(p.dual_volumes() > 0)
+        p._check_orientation()
