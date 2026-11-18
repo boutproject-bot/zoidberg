@@ -59,9 +59,15 @@ Parallel operators (support operator method, read by ``PetscOperators``)
     :func:`zoidberg.weights.calculate_parallel_map_operators`, with
     single-sample legs. Interior leg rows hold a value-interpolation stencil:
     a least-squares fit of order ``p = 4`` (default ``map_order``) over the
-    ``num_coefs(p) + 4`` nearest
-    target-plane nodes in anisotropically scaled coordinates
-    ``(R/h_R, Z/h_Z)``, using minimum-image offsets in periodic directions.
+    ``num_coefs(p) + 16`` nearest target-plane unknowns (``map_extra``) in
+    anisotropically scaled coordinates ``(R/h_R, Z/h_Z)``, weighted by
+    ``(r0/max(r, r0))^3`` (``map_weight_power``; r the scaled distance, r0
+    the larger of the nearest distance and one node spacing), using
+    minimum-image offsets in periodic directions. The weighting keeps the
+    interpolation amplification sum|w| small (on the Dommaschk example a
+    median of 1.6 and a maximum of 2.6, instead of 2.1 and 6.6 for an
+    unweighted fit over ``num_coefs(p) + 4`` nodes), which reduces the
+    number of solver steps in stiff parallel-conduction problems.
     If an end point coincides with a node (within ``snap_tol*h``), the row is
     an injection.
 
@@ -73,9 +79,9 @@ Perpendicular diffusion (poloidal-plane form)
     ``dagp_us_n_facepoints``, ``dagp_us_facepoint_owner`` (stored cell
     number of the lower-numbered node of each face) and ``dagp_us_volume``
     (dual-cell area, a Field3D). Optional (written by this module, used for
-    upwinding and flows): ``dagp_us_left``/``dagp_us_right`` (second-order
-    upwind reconstruction a_side + (x_f - x_side).grad a(side) from the node
-    on either side of each face point) and ``dagp_us_flowR``/
+    upwinding and flows): ``dagp_us_left``/``dagp_us_right`` (upwind
+    reconstruction from the unknown on either side of each face point: its
+    order-p least-squares fit evaluated at the face point) and ``dagp_us_flowR``/
     ``dagp_us_flowZ`` (cell average of the flux vector -a grad f,
     ``(1/V) sum_f (x_f - x_node) * outward flux``, exact for linear f).
 
@@ -853,10 +859,12 @@ class UnstructuredPoloidalGrid:
             u, v = u_all[todo, :kk], v_all[todo, :kk]
             V = _monomials(u, v, p)  # (mt, kk, nc)
             if weight_power:
-                # Weighted least squares: w = (r0 / r)^weight_power, with r the
-                # scaled distance and r0 the distance of the closest point
+                # Weighted least squares: w = (r0 / max(r, r0))^weight_power,
+                # with r the scaled distance and r0 the larger of the closest
+                # distance and one node spacing (so that a target next to a
+                # node does not make the fit ill-conditioned)
                 r = np.sqrt(u**2 + v**2)
-                r0 = np.maximum(r.min(axis=1, keepdims=True), 1e-12)
+                r0 = np.maximum(r.min(axis=1, keepdims=True), 1.0)
                 sw = np.sqrt((r0 / np.maximum(r, r0)) ** weight_power)
                 V = V * sw[..., None]
             sv = np.linalg.svd(V, compute_uv=False)
@@ -1154,7 +1162,7 @@ def trace_maps(grid, field, rtol=1e-10, field_tracer=None, domain_tol=1e-9):
 
 
 def som_weights(
-    grid, maps, order=4, strict=True, snap_tol=1e-10, extra=4, weight_power=0.0
+    grid, maps, order=4, strict=True, snap_tol=1e-10, extra=16, weight_power=3.0
 ):
     """Cell numbering, leg metadata and CSR operators for ``PetscOperators``.
 
@@ -1299,6 +1307,7 @@ def _plane_dagp(
     stability_tol=1e-10,
     cylindrical=False,
     stabilisation_form="polynomial",
+    reconstruction="polynomial",
 ):
     """Per-plane CSR blocks (local node / face-point numbering).
 
@@ -1468,32 +1477,47 @@ def _plane_dagp(
                     f"Perpendicular operator still has growing modes "
                     f"(max Re = {max_re:.2g} * norm) with beta = {beta}"
                 )
+
+        # Upwind reconstruction of a at each face point from either side
+        if reconstruction == "polynomial":
+            # Order-p fit around the side's unknown, evaluated at the face
+            # point: O(h^(p+1)). (The linear form below is only O(h^2) per
+            # face point, which on irregular meshes gives an O(h)
+            # truncation error once upwinding is on.)
+            lsq_v = dict(lsq, gradient=False)
+
+            def recon(node, offset):
+                r_inds, _, w_e, r_info = pol.lsq_weights(
+                    pol.dof[node], eval_offsets=offset[:, None, :], **lsq_v
+                )
+                return r_inds, w_e[:, 0, :], r_info["fallback"]
+
+        elif reconstruction == "linear":
+            # a_side + (x_f - x_side) . grad a(side)
+            def recon(node, offset):
+                cols = np.column_stack([node, n_inds[node]])
+                w = np.column_stack(
+                    [
+                        np.ones(len(node)),
+                        offset[:, :1] * n_dR[node] + offset[:, 1:] * n_dZ[node],
+                    ]
+                )
+                return cols, w, 0
+
+        else:
+            raise ValueError(f"Unknown reconstruction '{reconstruction}'")
+        # Offsets from the unknowns (nodes or dual-cell centroids)
+        off_l, off_r = pos_i, pos_i - edge_fp
+        if shift is not None:
+            off_l, off_r = off_l + shift[fi], off_r + shift[fj]
+        left_inds, left_w, fb_l = recon(fi, off_l)
+        right_inds, right_w, fb_r = recon(fj, off_r)
+        fallback += fb_l + fb_r
     finally:
         pol.h = saved_h
         pol._kdtree = None
     owner_node = np.minimum(fi, fj)
 
-    # Second-order upwind reconstruction of a from either side of each face
-    # point: a_side + (x_f - x_side) . grad a(side)
-    def reconstruction(node, offset):
-        k = n_inds.shape[1]
-        cols = np.column_stack([node, n_inds[node]])
-        w = np.column_stack(
-            [
-                np.ones(len(node)),
-                offset[:, :1] * n_dR[node] + offset[:, 1:] * n_dZ[node],
-            ]
-        )
-        assert cols.shape[1] == k + 1
-        return cols, w
-
-    if shift is None:
-        left_inds, left_w = reconstruction(fi, pos_i)
-        right_inds, right_w = reconstruction(fj, pos_i - edge_fp)
-    else:
-        # Offsets from the unknowns rather than the nodes
-        left_inds, left_w = reconstruction(fi, pos_i + shift[fi])
-        right_inds, right_w = reconstruction(fj, pos_i - edge_fp + shift[fj])
     return {
         "n_fp": len(fi),
         "inds": inds,
@@ -1773,8 +1797,8 @@ def build_grid_data(
     strict=True,
     rtol=1e-10,
     domain_tol=1e-9,
-    map_extra=4,
-    map_weight_power=0.0,
+    map_extra=16,
+    map_weight_power=3.0,
 ):
     """Compute every variable of the grid-file contract. Returns
     ``(data, stats)``.

@@ -632,3 +632,74 @@ def test_lsq_eval_offsets_exact():
     got = np.einsum("mqk,mk->mq", w_eval, vals)
     pts = targets[:, None, :] + offsets
     assert np.allclose(got, poly(pts[..., 0], pts[..., 1]), atol=1e-10)
+
+
+def test_upwind_reconstruction_order():
+    # Upwinding with the polynomial reconstruction stays second order at
+    # fine resolution (the linear reconstruction drops to ~1.5 at n = 128 on
+    # this anisotropic strip) and matches the central value closely
+    from scipy.sparse import csr_matrix
+
+    k = 2 * np.pi
+    errs = {"value": [], "upwind": []}
+    for n in (64, 128):
+        pol = us.UnstructuredPoloidalGrid.slab(
+            8, n, 0.1, 1.0, R0=-0.05, jitter=0.2, jitter_dirs="z", seed=1234 + n
+        )
+        grid = us.UnstructuredGrid(pol, np.array([0.0]), 10.0)
+        cn = np.full(grid.shape, -1)
+        cn[1:-1, 0, 0] = np.arange(pol.n_nodes)
+        d, _ = us.dagp_unstructured(grid, cn, pol.n_nodes, strict=False, order=4)
+        nfp, nn = d["dagp_us_n_facepoints"], pol.n_nodes
+
+        def mat(name, shape, d=d):
+            return csr_matrix(
+                (
+                    d[f"dagp_us_{name}_weights"],
+                    d[f"dagp_us_{name}_columns"],
+                    d[f"dagp_us_{name}_rows"],
+                ),
+                shape=shape,
+            )
+
+        G, V, D = (
+            mat("gradp", (nfp, nn)),
+            mat("value", (nfp, nn)),
+            mat("div", (nn, nfp)),
+        )
+        left, right = mat("left", (nfp, nn)), mat("right", (nfp, nn))
+        z = k * pol.Z
+        f = np.sin(np.pi - 2 * z) + np.sin(np.pi - z)
+        a = np.cos(np.pi - z) + 2.0
+        fz = -2 * np.cos(np.pi - 2 * z) - np.cos(np.pi - z)
+        fzz = -4 * np.sin(np.pi - 2 * z) - np.sin(np.pi - z)
+        ex = k * k * (a * fzz + np.sin(np.pi - z) * fz)
+        g = G @ f
+        for name, af in (
+            ("value", V @ a),
+            ("upwind", np.where(g > 0, right @ a, left @ a)),
+        ):
+            errs[name].append(np.sqrt(np.mean((D @ (af * g) - ex) ** 2)))
+    order = np.log2(errs["upwind"][0] / errs["upwind"][1])
+    assert order > 1.9, errs
+    assert np.allclose(errs["upwind"], errs["value"], rtol=0.05), errs
+
+
+def test_map_interpolation_amplification():
+    # The parallel-map weights must not amplify much: large sum|w| spreads
+    # grid-scale noise into stiff parallel conduction (more solver steps)
+    from scipy.sparse import csr_matrix
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        _, data, _ = us.make_test_grid("bout_mms", 16)
+    for name in ("forward", "backward"):
+        nl = data[f"n_{name}_legs"]
+        w = csr_matrix(
+            (data[f"{name}_weights"], data[f"{name}_columns"], data[f"{name}_rows"]),
+            shape=(nl, data["total_cells"]),
+        )
+        amp = np.asarray(abs(w).sum(axis=1)).ravel()
+        interior = np.diff(w.indptr) > 1  # not boundary (single-entry) legs
+        assert np.median(amp[interior]) < 1.7, np.median(amp[interior])
+        assert amp.max() < 4.0, amp.max()
