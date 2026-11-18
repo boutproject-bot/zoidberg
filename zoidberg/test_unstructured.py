@@ -1,4 +1,5 @@
 import warnings
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -752,3 +753,52 @@ def test_value_fit_order_and_size():
         res = (D @ ((V @ a) * (G @ f)))[node]
         errs.append(np.sqrt(np.mean((res - ex)[grid.interior] ** 2)))
     assert np.log2(errs[0] / errs[1]) > 1.8, errs
+
+
+def test_operator_order_four_resolutions():
+    # Report section f.1: hidden O(h) terms (the earlier stabilisation
+    # bracket and upwind reconstruction) only showed beyond n = 64, so check
+    # every pair of four resolutions up to n = 96 on an unrelaxed mesh with
+    # centroid unknowns
+    def mesh(n):
+        return us.UnstructuredPoloidalGrid.slab(
+            n,
+            n,
+            1.0,
+            1.0,
+            jitter=0.2,
+            jitter_dirs="rz",
+            periodic_R=True,
+            periodic_Z=True,
+            seed=5 + n,
+            relax=False,
+        ).use_centroid_dofs()
+
+    errs = np.array([_plane_laplacian_error(mesh(n)) for n in (12, 24, 48, 96)])
+    orders = np.log2(errs[:-1] / errs[1:])
+    assert np.all(orders > 1.9), orders
+
+
+def test_grid_generation_memory():
+    # Report section f.7: grid generation competes for memory with
+    # simulations; keep the peak memory of a test-grid build bounded.
+    # VmHWM of the child process (ru_maxrss would include the pytest
+    # parent's high-water mark, which Linux keeps across exec)
+    import subprocess
+    import sys
+
+    if not Path("/proc/self/status").exists():
+        pytest.skip("needs /proc/self/status")
+    code = (
+        "import warnings\n"
+        "warnings.simplefilter('ignore')\n"
+        "from zoidberg import unstructured as us\n"
+        "us.make_test_grid('bout_mms', 16)\n"
+        "line = [l for l in open('/proc/self/status') if l.startswith('VmHWM')][0]\n"
+        "print(int(line.split()[1]))\n"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, check=True
+    )
+    peak_mb = int(out.stdout.split()[-1]) / 1024
+    assert peak_mb < 1024, f"peak memory {peak_mb:.0f} MB"
