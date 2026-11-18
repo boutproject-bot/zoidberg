@@ -807,3 +807,84 @@ def test_grid_generation_memory():
     )
     peak_mb = int(out.stdout.split()[-1]) / 1024
     assert peak_mb < 1024, f"peak memory {peak_mb:.0f} MB"
+
+
+def test_grid_generation_memory_scaling():
+    # Peak memory of grid generation per cell, at two sizes, in fresh
+    # processes (VmHWM minus the resident memory after the imports). The
+    # perpendicular-operator assembly works plane by plane and the
+    # least-squares fits in blocks, so the peak is about 34 kB per cell
+    # (before: 77 kB per cell, 4.0 GB for the 3 mm Dommaschk grid) and
+    # does not grow faster than the number of cells.
+    import subprocess
+    import sys
+
+    if not Path("/proc/self/status").exists():
+        pytest.skip("needs /proc/self/status")
+    code = (
+        "import sys, warnings\n"
+        "warnings.simplefilter('ignore')\n"
+        "from zoidberg import unstructured as us\n"
+        "def st(key):\n"
+        "    return [int(l.split()[1]) for l in open('/proc/self/status')\n"
+        "            if l.startswith(key)][0]\n"
+        "base = st('VmRSS')\n"
+        "_, data, _ = us.make_test_grid('bout_mms_cyl_sheared', int(sys.argv[1]))\n"
+        "print(int(data['total_cells']), st('VmHWM') - base)\n"
+    )
+    per_cell = {}
+    for n in (16, 24):
+        out = subprocess.run(
+            [sys.executable, "-c", code, str(n)],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        cells, kb = (int(v) for v in out.stdout.split()[-2:])
+        per_cell[n] = kb / cells
+    assert max(per_cell.values()) < 50.0, per_cell
+    assert per_cell[24] < 1.2 * per_cell[16], per_cell
+
+
+def test_lsq_blocks_and_repeated_targets_identical():
+    # lsq_weights solves each target independently: processing the targets
+    # in blocks and fitting repeated targets once give the same weights
+    pol = us.UnstructuredPoloidalGrid.slab(
+        12, 12, 1.0, 1.0, jitter=0.2, jitter_dirs="rz", seed=3
+    )
+    rng = np.random.default_rng(1)
+    targets = pol.dof[rng.integers(0, pol.n_nodes, 300)]  # many repeats
+    offsets = 0.05 * rng.standard_normal((300, 2, 2))
+    kwargs = {"order": 3, "gradient": True, "eval_offsets": offsets}
+    ref = pol.lsq_weights(targets, **kwargs)
+    pol.lsq_block_size = 37
+    blocked = pol.lsq_weights(targets, **kwargs)
+    # One target at a time (no blocks, no repeats)
+    single = [
+        pol.lsq_weights(t[None], order=3, gradient=True, eval_offsets=o[None])
+        for t, o in zip(targets, offsets)
+    ]
+    for i in range(5):
+        assert np.array_equal(ref[i], blocked[i])
+        assert np.array_equal(ref[i], np.concatenate([s[i] for s in single]))
+    assert ref[5] == blocked[5]
+
+
+def test_parallel_planes_identical():
+    # dagp_unstructured with worker processes gives the same arrays
+    planes = [
+        us.UnstructuredPoloidalGrid.slab(
+            8, 8, 1.0, 1.0, jitter=0.2, jitter_dirs="z", seed=20 + j
+        )
+        for j in range(4)
+    ]
+    field = zbfield.Slab(Bz=0.05, Bzprime=0.1)
+    results = []
+    for processes in (1, 3):
+        _, data, _ = us.make_unstructured_grid(
+            None, planes, field, ny=4, Ly=1.0, processes=processes
+        )
+        results.append(data)
+    assert results[0].keys() == results[1].keys()
+    for key in results[0]:
+        assert np.array_equal(np.asarray(results[0][key]), np.asarray(results[1][key]))

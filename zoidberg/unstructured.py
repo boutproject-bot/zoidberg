@@ -114,6 +114,7 @@ Metric
 from __future__ import annotations
 
 import warnings
+from collections import Counter
 from dataclasses import dataclass
 from dataclasses import field as dc_field
 
@@ -152,6 +153,19 @@ def _monomials(u, v, order):
         for j in range(degree + 1):
             cols.append(u ** (degree - j) * v**j)
     return np.stack(cols, axis=-1)
+
+
+def _pinv_from_svd(u, s, vt):
+    """Pseudo-inverses of stacked matrices from their (reduced) SVD, exactly
+    as :func:`numpy.linalg.pinv` computes them with its default tolerance
+    (singular values below 1e-15 times the largest are dropped)."""
+    cutoff = np.asarray(1e-15)[..., None] * np.amax(s, axis=-1, keepdims=True)
+    large = s > cutoff
+    s = np.divide(1, s, where=large, out=s.copy())
+    s[~large] = 0
+    return np.matmul(
+        np.swapaxes(vt, -1, -2), np.multiply(s[..., None], np.swapaxes(u, -1, -2))
+    )
 
 
 def _morton_order(R, Z, bits=16):
@@ -264,6 +278,9 @@ class UnstructuredPoloidalGrid:
         :meth:`slab`, the walls are the lines of minimum and maximum R.
         See :meth:`from_structured` and :meth:`mark_boundary_walls`.
     """
+
+    #: Number of targets per block in :meth:`lsq_weights` (memory bound)
+    lsq_block_size = 8192
 
     def __init__(
         self,
@@ -834,6 +851,57 @@ class UnstructuredPoloidalGrid:
                 f"Need at least {k0} nodes for an order-{order} stencil, "
                 f"mesh has {self.n_nodes}"
             )
+        # The fits are independent per target: process the targets in blocks
+        # so that the work arrays (Vandermonde matrices, SVDs, pseudo-
+        # inverses: O(block * k * num_coefs)) stay small
+        block = self.lsq_block_size
+        if m > block:
+            parts = []
+            for start in range(0, m, block):
+                sl = slice(start, start + block)
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", StencilFallbackWarning)
+                    parts.append(
+                        self.lsq_weights(
+                            targets[sl],
+                            order=order,
+                            extra=extra,
+                            gradient=gradient,
+                            snap_tol=snap_tol,
+                            max_cond=max_cond,
+                            strict=strict,
+                            weight_power=weight_power,
+                            eval_offsets=None
+                            if eval_offsets is None
+                            else np.asarray(eval_offsets, dtype=float)[sl],
+                        )
+                    )
+            info = {
+                key: sum(part[-1][key] for part in parts)
+                for key in ("fallback", "snapped")
+            }
+            if info["fallback"]:
+                warnings.warn(
+                    f"{info['fallback']} of {m} stencils dropped below order {order}",
+                    StencilFallbackWarning,
+                )
+            n_out = len(parts[0]) - 1
+            out = tuple(
+                np.concatenate([part[i] for part in parts]) for i in range(n_out)
+            )
+            return out + (info,)
+        # Targets that occur several times (e.g. the reconstructions around
+        # a node, evaluated at each of its face points) are fitted once
+        inverse = None
+        if eval_offsets is not None and m > 1:
+            uniq, inverse = np.unique(targets, axis=0, return_inverse=True)
+            inverse = np.ravel(inverse)
+            if len(uniq) > 0.75 * m:
+                inverse = None
+            else:
+                targets = uniq
+        mu = len(targets)
+
         # Stencils grow before they drop in order: next to a wall, the k0
         # nearest nodes can span too few layers for a full-order fit.
         k_list = [kk for kk in (k0, k0 + 6, k0 + 14) if kk <= self.n_nodes]
@@ -845,15 +913,13 @@ class UnstructuredPoloidalGrid:
         u_all = offsets[..., 0] / self.h[0]
         v_all = offsets[..., 1] / self.h[1]
 
-        inds = np.zeros((m, kmax), dtype=int)
-        w_val = np.zeros((m, kmax))
-        w_dR = np.zeros((m, kmax))
-        w_dZ = np.zeros((m, kmax))
-        if eval_offsets is not None:
-            eval_offsets = np.asarray(eval_offsets, dtype=float)
-            w_eval = np.zeros((m, eval_offsets.shape[1], kmax))
-        done = np.zeros(m, dtype=bool)
-        fallback = 0
+        inds = np.zeros((mu, kmax), dtype=int)
+        w_val = np.zeros((mu, kmax))
+        w_dR = np.zeros((mu, kmax))
+        w_dZ = np.zeros((mu, kmax))
+        groups = []  # (targets, order, stencil size, pseudo-inverses)
+        done = np.zeros(mu, dtype=bool)
+        fallback_targets = np.zeros(mu, dtype=bool)
         attempts = [(p, kk) for p in range(order, 0, -1) for kk in k_list]
         for attempt, (p, kk) in enumerate(attempts):
             todo = np.flatnonzero(~done)
@@ -870,7 +936,9 @@ class UnstructuredPoloidalGrid:
                 r0 = np.maximum(r.min(axis=1, keepdims=True), 1.0)
                 sw = np.sqrt((r0 / np.maximum(r, r0)) ** weight_power)
                 V = V * sw[..., None]
-            sv = np.linalg.svd(V, compute_uv=False)
+            # One SVD gives both the condition number and the pseudo-inverse
+            # (computed as numpy.linalg.pinv does)
+            su, sv, svt = np.linalg.svd(V, full_matrices=False)
             cond = sv[:, 0] / np.maximum(sv[:, -1], 1e-300)
             last = attempt == len(attempts) - 1
             good = (cond <= max_cond) | last
@@ -881,7 +949,7 @@ class UnstructuredPoloidalGrid:
                     "fallback"
                 )
             idx = todo[good]
-            P = np.linalg.pinv(V[good])  # (mg, nc, kk)
+            P = _pinv_from_svd(su[good], sv[good], svt[good])
             if weight_power:
                 P = P * sw[good][:, None, :]
             inds[idx] = inds_all[idx]
@@ -889,32 +957,47 @@ class UnstructuredPoloidalGrid:
             w_dR[idx, :kk] = P[:, 1, :] / self.h[0]
             w_dZ[idx, :kk] = P[:, 2, :] / self.h[1]
             if eval_offsets is not None:
-                off = eval_offsets[idx]
-                mono = _monomials(off[..., 0] / self.h[0], off[..., 1] / self.h[1], p)
-                w_eval[idx, :, :kk] = mono @ P
+                groups.append((idx, p, kk, P))
             done[idx] = True
             if p < order:
-                fallback += len(idx)
-        if fallback:
-            warnings.warn(
-                f"{fallback} of {m} stencils dropped below order {order}",
-                StencilFallbackWarning,
-            )
+                fallback_targets[idx] = True
         u_all0 = u_all[:, 0]
         v_all0 = v_all[:, 0]
 
-        snapped = np.zeros(m, dtype=bool)
+        snapped = np.zeros(mu, dtype=bool)
         if snap_tol is not None:
             nearest = np.sqrt(u_all0**2 + v_all0**2)
             snapped = nearest < snap_tol
             w_val[snapped] = 0.0
             w_val[snapped, 0] = 1.0
-        info = {"fallback": fallback, "snapped": int(np.sum(snapped))}
+        if inverse is not None:
+            inds, w_val, w_dR, w_dZ = (a[inverse] for a in (inds, w_val, w_dR, w_dZ))
+            snapped, fallback_targets = snapped[inverse], fallback_targets[inverse]
+        fallback = int(np.sum(fallback_targets))
+        if fallback:
+            warnings.warn(
+                f"{fallback} of {m} stencils dropped below order {order}",
+                StencilFallbackWarning,
+            )
         out = (inds, w_val)
         if gradient:
             out += (w_dR, w_dZ)
         if eval_offsets is not None:
+            eval_offsets = np.asarray(eval_offsets, dtype=float)
+            w_eval = np.zeros((m, eval_offsets.shape[1], kmax))
+            for idx, p, kk, P in groups:
+                if inverse is None:
+                    sel, Psel = idx, P
+                else:
+                    row = np.full(mu, -1)
+                    row[idx] = np.arange(len(idx))
+                    sel = np.flatnonzero(row[inverse] >= 0)
+                    Psel = P[row[inverse[sel]]]
+                off = eval_offsets[sel]
+                mono = _monomials(off[..., 0] / self.h[0], off[..., 1] / self.h[1], p)
+                w_eval[sel, :, :kk] = mono @ Psel
             out += (w_eval,)
+        info = {"fallback": fallback, "snapped": int(np.sum(snapped))}
         return out + (info,)
 
     def in_domain(self, pos, tol=1e-9):
@@ -1600,6 +1683,7 @@ def dagp_unstructured(
     order=3,
     rule="gauss2",
     strict=True,
+    processes=1,
     **plane_options,
 ):
     """Global CSR matrices for ``FV::Div_a_Grad_perp_FCI_unstructured``.
@@ -1607,46 +1691,100 @@ def dagp_unstructured(
     Only evolving nodes get a divergence row. Face points between two
     Dirichlet wall nodes are dropped; faces between a wall node and an
     evolving node use the wall value, which BOUT++ holds in the guard cell.
+
+    ``processes > 1`` computes the planes in that many worker processes (at
+    most ``processes`` planes ahead of the assembly, so that memory stays
+    bounded); the result is the same as with one process.
     """
     interior = grid.interior
+    # Planes are processed one at a time and their blocks released after use
+    # (planes that share one UnstructuredPoloidalGrid are computed once and
+    # kept until their last use). The face-point rows of the gradient, value
+    # and reconstruction matrices are contiguous per plane, so their CSR
+    # arrays are built per plane and concatenated; this gives the same arrays
+    # as one global assembly, without holding the padded triplets of all
+    # planes at once.
+    remaining = Counter(id(grid.plane(y)) for y in range(grid.ny))
     cache = {}
-    blocks = []
-    for y in range(grid.ny):
-        pol = grid.plane(y)
-        if id(pol) not in cache:
-            cache[id(pol)] = _plane_dagp(
-                pol, order=order, rule=rule, strict=strict, **plane_options
-            )
-        blocks.append(cache[id(pol)])
+    plane_kwargs = dict(order=order, rule=rule, strict=strict, **plane_options)
+    # First plane index of each distinct poloidal grid, in order of use
+    first_use = sorted(
+        {id(grid.plane(y)): y for y in reversed(range(grid.ny))}.values()
+    )
+    pending = {}
+    executor = None
+    if processes > 1 and len(first_use) > 1:
+        import multiprocessing
+        from concurrent.futures import ProcessPoolExecutor
 
-    keeps = [interior[b["fi"]] | interior[b["fj"]] for b in blocks]
-    n_fp_total = int(sum(np.sum(k) for k in keeps))
-    gr, gc, gv = [], [], []
-    vr, vc, vv = [], [], []
+        executor = ProcessPoolExecutor(
+            max_workers=processes, mp_context=multiprocessing.get_context("fork")
+        )
+    next_submit = 0
+
+    def submit_ahead():
+        nonlocal next_submit
+        while next_submit < len(first_use) and len(pending) < processes:
+            y_s = first_use[next_submit]
+            pending[id(grid.plane(y_s))] = executor.submit(
+                _plane_dagp, grid.plane(y_s), **plane_kwargs
+            )
+            next_submit += 1
+
+    stats = {"fallback": 0, "beta": -np.inf, "max_re": -np.inf}
+    row_mats = {name: ([], [], []) for name in ("gradp", "value", "left", "right")}
     dr, dc, dv = [], [], []
-    lr, lc, lv, rr, rc, rv = [], [], [], [], [], []  # upwind reconstructions
     fr, fc, fR, fZ = [], [], [], []  # cell-averaged flux vector
-    owner = np.empty(n_fp_total, dtype=int)
+    owners = []
     volume = np.zeros((grid.ny, grid.n_nodes))
     offset = 0
-    for y, (b, keep) in enumerate(zip(blocks, keeps)):
+
+    def add_rows(name, inds, w, cells):
+        """Per-plane CSR block of a matrix with one row per face point."""
+        ptrs, cols, vals = row_mats[name]
+        nfp, k = inds.shape
+        r = np.repeat(np.arange(nfp), k)
+        c = cells[inds].ravel()
+        v = w.ravel()
+        keep = np.abs(v) > 1e-300
+        ptr, col, val = _csr(nfp, r[keep], c[keep], v[keep])
+        ptrs.append(ptr[1:] + sum(len(a) for a in cols))
+        cols.append(col)
+        vals.append(val)
+
+    for y in range(grid.ny):
+        pol = grid.plane(y)
+        key = id(pol)
+        if key in cache:
+            b = cache[key]
+        else:
+            if executor is not None:
+                submit_ahead()
+                b = pending.pop(key).result()
+                submit_ahead()
+            else:
+                b = _plane_dagp(pol, **plane_kwargs)
+            stats["fallback"] += b["fallback"]
+            stats["beta"] = max(stats["beta"], b["beta"])
+            stats["max_re"] = max(stats["max_re"], b["max_re"] or 0.0)
+        remaining[key] -= 1
+        if remaining[key] > 0:
+            cache[key] = b
+        else:
+            cache.pop(key, None)
+
+        keep = interior[b["fi"]] | interior[b["fj"]]
         cells = cell_number[grid.node_x, y, 0]
         nfp = int(np.sum(keep))
         rows = offset + np.arange(nfp)
-        inds, fi, fj = b["inds"][keep], b["fi"][keep], b["fj"][keep]
-        k = inds.shape[1]
-        gr.append(np.repeat(rows, k))
-        gc.append(cells[inds].ravel())
-        gv.append(b["w_grad"][keep].ravel())
+        fi, fj = b["fi"][keep], b["fj"][keep]
+        add_rows("gradp", b["inds"][keep], b["w_grad"][keep], cells)
         if b["v_inds"] is None:
-            vr.append(np.repeat(rows, k))
-            vc.append(cells[inds].ravel())
-            vv.append(b["w_val"][keep].ravel())
+            add_rows("value", b["inds"][keep], b["w_val"][keep], cells)
         else:
-            v_inds = b["v_inds"][keep]
-            vr.append(np.repeat(rows, v_inds.shape[1]))
-            vc.append(cells[v_inds].ravel())
-            vv.append(b["v_val"][keep].ravel())
+            add_rows("value", b["v_inds"][keep], b["v_val"][keep], cells)
+        add_rows("left", b["left_inds"][keep], b["left_w"][keep], cells)
+        add_rows("right", b["right_inds"][keep], b["right_w"][keep], cells)
         mi, mj = interior[fi], interior[fj]
         dr.append(cells[fi][mi])
         dc.append(rows[mi])
@@ -1654,13 +1792,6 @@ def dagp_unstructured(
         dr.append(cells[fj][mj])
         dc.append(rows[mj])
         dv.append(-1.0 / b["vol"][fj][mj])
-        kl = b["left_inds"].shape[1]
-        lr.append(np.repeat(rows, kl))
-        lc.append(cells[b["left_inds"][keep]].ravel())
-        lv.append(b["left_w"][keep].ravel())
-        rr.append(np.repeat(rows, kl))
-        rc.append(cells[b["right_inds"][keep]].ravel())
-        rv.append(b["right_w"][keep].ravel())
         # The physical flux is -a grad f, so the outward flux of node i through
         # this face point is -F (F = a S.grad f) and that of node j is +F.
         # Cell average of the flux vector: sum (x_f - x_node) * outward / V
@@ -1672,22 +1803,34 @@ def dagp_unstructured(
         fZ += [-pos_i[mi, 1] / vi[mi], pos_j[mj, 1] / vj[mj]]
         # Owned with an evolving node
         owner_node = np.where(mi & mj, np.minimum(fi, fj), np.where(mi, fi, fj))
-        owner[rows] = cells[owner_node]
+        owners.append(cells[owner_node])
         volume[y] = b["vol"]
         offset += nfp
+        del b
+    if executor is not None:
+        executor.shutdown()
+    n_fp_total = offset
 
     def build(r, c, v, n_rows):
         r, c, v = np.concatenate(r), np.concatenate(c), np.concatenate(v)
         keep = np.abs(v) > 1e-300
         return _csr(n_rows, r[keep], c[keep], v[keep])
 
-    out = {"dagp_us_n_facepoints": n_fp_total, "dagp_us_facepoint_owner": owner}
+    out = {
+        "dagp_us_n_facepoints": n_fp_total,
+        "dagp_us_facepoint_owner": np.concatenate(owners).astype(int),
+    }
+    for name in ("gradp", "value", "left", "right"):
+        ptrs, cols, vals = row_mats.pop(name)
+        out[f"dagp_us_{name}_rows"] = np.concatenate([np.zeros(1, dtype=int)] + ptrs)
+        del ptrs
+        out[f"dagp_us_{name}_columns"] = np.concatenate(cols)
+        del cols
+        out[f"dagp_us_{name}_weights"] = np.concatenate(vals)
+        del vals
+        out[f"dagp_us_{name}_ncols"] = total_cells
     for name, (r, c, v, nrow, ncol) in {
-        "gradp": (gr, gc, gv, n_fp_total, total_cells),
-        "value": (vr, vc, vv, n_fp_total, total_cells),
         "div": (dr, dc, dv, total_cells, n_fp_total),
-        "left": (lr, lc, lv, n_fp_total, total_cells),
-        "right": (rr, rc, rv, n_fp_total, total_cells),
         "flowR": (fr, fc, fR, total_cells, n_fp_total),
         "flowZ": (fr, fc, fZ, total_cells, n_fp_total),
     }.items():
@@ -1697,11 +1840,6 @@ def dagp_unstructured(
         out[f"dagp_us_{name}_weights"] = vals
         out[f"dagp_us_{name}_ncols"] = ncol
     out["dagp_us_volume"] = grid.to3d(volume)
-    stats = {
-        "fallback": sum(b["fallback"] for b in cache.values()),
-        "beta": max(b["beta"] for b in cache.values()),
-        "max_re": max((b["max_re"] or 0.0) for b in cache.values()),
-    }
     return out, stats
 
 
@@ -1842,6 +1980,7 @@ def build_grid_data(
     map_weight_power=3.0,
     dagp_extra=16,
     value_order=2,
+    processes=1,
 ):
     """Compute every variable of the grid-file contract. Returns
     ``(data, stats)``.
@@ -1862,6 +2001,9 @@ def build_grid_data(
     and ``value_order`` the order of the separate fit for the face values of
     the coefficient a (2 by default: second order with about a third of the
     nonzeros of the gradient fit; ``None`` reuses the gradient fit).
+    ``processes`` is the number of worker processes for the perpendicular
+    operator of the planes (see :func:`dagp_unstructured`; each worker holds
+    one plane, about 0.3 GB for a 7000-node gmsh plane).
     """
     maps = trace_maps(grid, field, rtol=rtol, domain_tol=domain_tol)
     som, som_stats = som_weights(
@@ -1882,6 +2024,7 @@ def build_grid_data(
         cylindrical=is_cylindrical(field),
         extra=dagp_extra,
         value_order=value_order,
+        processes=processes,
     )
     volume = np.array([grid.plane(j).dual_volumes() for j in range(grid.ny)])
     data = {}
