@@ -88,10 +88,13 @@ Perpendicular diffusion (poloidal-plane form)
     ``div @ ((value @ a) * (gradp @ f))`` approximates
     ``div_pol(a grad_pol f)`` with node-centred, centroid-dual finite
     volumes. Each face has quadrature points with least-squares gradients
-    plus one stabilisation point (compact two-point difference minus its
-    high-order prediction) that removes growing grid-scale modes. Interior dual faces connect the centroids of the two adjacent
-    triangles; at a boundary edge the face runs from the centroid to the edge
-    midpoint, and the wall itself is zero-flux.
+    (order 4) plus one stabilisation point (compact two-point difference
+    minus its high-order prediction) that removes growing grid-scale modes.
+    The face values of a come from a separate order-2 fit (``value_order``),
+    which is enough for second order. Interior dual faces connect the
+    centroids of the two adjacent triangles; at a boundary edge the face
+    runs from the centroid to the edge midpoint, and the wall itself is
+    zero-flux.
 
 Metric
     ``dx = dz = 1`` (Coordinates requires uniform dx, dz for FCI; the
@@ -1317,6 +1320,8 @@ def _plane_dagp(
     cylindrical=False,
     stabilisation_form="polynomial",
     reconstruction="polynomial",
+    value_order=None,
+    value_extra=4,
 ):
     """Per-plane CSR blocks (local node / face-point numbering).
 
@@ -1522,6 +1527,24 @@ def _plane_dagp(
         left_inds, left_w, fb_l = recon(fi, off_l)
         right_inds, right_w, fb_r = recon(fj, off_r)
         fallback += fb_l + fb_r
+
+        # Face values of the coefficient a. By default they come from the
+        # gradient fit; a separate lower-order fit is enough for second order
+        # (the flux error (delta a) S.grad f is O(h^(q+2)) per face for an
+        # order-q value fit) and needs far fewer nodes
+        v_inds = v_val = None
+        if value_order is not None:
+            pts = pol.wrap(fp)
+            if stabilisation:
+                pts = np.vstack([pts, mid])
+            v_inds, v_val, v_info = pol.lsq_weights(
+                pts,
+                order=value_order,
+                extra=min(value_extra, max(pol.n_nodes - num_coefs(value_order), 0)),
+                snap_tol=None,
+                strict=strict,
+            )
+            fallback += v_info["fallback"]
     finally:
         pol.h = saved_h
         pol._kdtree = None
@@ -1532,6 +1555,8 @@ def _plane_dagp(
         "inds": inds,
         "w_val": w_val,
         "w_grad": w_grad,
+        "v_inds": v_inds,
+        "v_val": v_val,
         "fi": fi,
         "fj": fj,
         "owner_node": owner_node,
@@ -1613,9 +1638,15 @@ def dagp_unstructured(
         gr.append(np.repeat(rows, k))
         gc.append(cells[inds].ravel())
         gv.append(b["w_grad"][keep].ravel())
-        vr.append(np.repeat(rows, k))
-        vc.append(cells[inds].ravel())
-        vv.append(b["w_val"][keep].ravel())
+        if b["v_inds"] is None:
+            vr.append(np.repeat(rows, k))
+            vc.append(cells[inds].ravel())
+            vv.append(b["w_val"][keep].ravel())
+        else:
+            v_inds = b["v_inds"][keep]
+            vr.append(np.repeat(rows, v_inds.shape[1]))
+            vc.append(cells[v_inds].ravel())
+            vv.append(b["v_val"][keep].ravel())
         mi, mj = interior[fi], interior[fj]
         dr.append(cells[fi][mi])
         dc.append(rows[mi])
@@ -1808,6 +1839,8 @@ def build_grid_data(
     domain_tol=1e-9,
     map_extra=16,
     map_weight_power=3.0,
+    dagp_extra=16,
+    value_order=2,
 ):
     """Compute every variable of the grid-file contract. Returns
     ``(data, stats)``.
@@ -1822,7 +1855,12 @@ def build_grid_data(
     the test grids). ``domain_tol``: see :func:`trace_maps`. ``map_extra``
     and ``map_weight_power`` set the stencil size (``num_coefs(map_order) +
     map_extra`` nodes) and the distance weighting of the parallel-map fits
-    (see :meth:`UnstructuredPoloidalGrid.lsq_weights`).
+    (see :meth:`UnstructuredPoloidalGrid.lsq_weights`). ``dagp_extra`` is
+    the number of extra nodes of the face-gradient fits (16 by default, needed
+    on coarse anisotropic meshes; 4 is enough on near-isotropic gmsh meshes)
+    and ``value_order`` the order of the separate fit for the face values of
+    the coefficient a (2 by default: second order with about a third of the
+    nonzeros of the gradient fit; ``None`` reuses the gradient fit).
     """
     maps = trace_maps(grid, field, rtol=rtol, domain_tol=domain_tol)
     som, som_stats = som_weights(
@@ -1841,6 +1879,8 @@ def build_grid_data(
         rule=rule,
         strict=strict,
         cylindrical=is_cylindrical(field),
+        extra=dagp_extra,
+        value_order=value_order,
     )
     volume = np.array([grid.plane(j).dual_volumes() for j in range(grid.ny)])
     data = {}
@@ -1907,11 +1947,14 @@ def make_unstructured_grid(
     multiple_of=4,
     dirichlet_walls=False,
     domain_tol=1e-9,
+    **grid_options,
 ):
     """Convenience wrapper: build the 3D grid, compute and write all data.
 
     ``poloidal`` is one :class:`UnstructuredPoloidalGrid` for every plane or
-    a list of ``ny`` of them (e.g. from :func:`gmsh_planes`).
+    a list of ``ny`` of them (e.g. from :func:`gmsh_planes`). Further keyword
+    arguments (``map_extra``, ``dagp_extra``, ``value_order``, ...) are passed
+    to :func:`build_grid_data`.
     """
     ycoords = np.linspace(0.0, Ly, ny, endpoint=False)
     grid = UnstructuredGrid(
@@ -1931,6 +1974,7 @@ def make_unstructured_grid(
         rule=rule,
         strict=strict,
         domain_tol=domain_tol,
+        **grid_options,
     )
     if filename is not None:
         write_unstructured(filename, grid, data)

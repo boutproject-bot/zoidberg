@@ -703,3 +703,52 @@ def test_map_interpolation_amplification():
         interior = np.diff(w.indptr) > 1  # not boundary (single-entry) legs
         assert np.median(amp[interior]) < 1.7, np.median(amp[interior])
         assert amp.max() < 4.0, amp.max()
+
+
+def test_value_fit_order_and_size():
+    # The separate order-2 fit for the face values of a keeps second order
+    # with a variable coefficient and needs far fewer nonzeros than the
+    # order-4 gradient fit
+    pytest.importorskip("gmsh")
+    from scipy.sparse import csr_matrix
+
+    outer, inner = _curved_annulus()
+    k = 2 * np.pi
+    errs = []
+    for h in (1 / 16, 1 / 32):
+        pol = us.UnstructuredPoloidalGrid.from_gmsh(outer, inner, mesh_size=h)
+        grid = us.UnstructuredGrid(
+            pol, np.array([0.0]), 1.0, dirichlet_walls=True, multiple_of=1
+        )
+        data, _ = us.build_grid_data(grid, zbfield.Slab(Bz=0.0, Bzprime=0.0))
+        cn = data["cell_number"][:, 0, 0]
+        nc, nfp = data["total_cells"], data["dagp_us_n_facepoints"]
+
+        def mat(name, shape, data=data):
+            return csr_matrix(
+                (
+                    data[f"dagp_us_{name}_weights"],
+                    data[f"dagp_us_{name}_columns"],
+                    data[f"dagp_us_{name}_rows"],
+                ),
+                shape=shape,
+            )
+
+        G, V, D = (
+            mat("gradp", (nfp, nc)),
+            mat("value", (nfp, nc)),
+            mat("div", (nc, nfp)),
+        )
+        assert V.nnz < 0.4 * G.nnz
+        node = cn[grid.node_x]
+        R, Z = pol.dof[:, 0], pol.dof[:, 1]
+        f, a = np.zeros(nc), np.zeros(nc)
+        f[node] = np.sin(k * R) * np.cos(k * Z)
+        a[node] = 1 + 0.5 * np.sin(k * R + 0.3) * np.cos(k * Z - 0.7)
+        fR, fZ = k * np.cos(k * R) * np.cos(k * Z), -k * np.sin(k * R) * np.sin(k * Z)
+        aR = 0.5 * k * np.cos(k * R + 0.3) * np.cos(k * Z - 0.7)
+        aZ = -0.5 * k * np.sin(k * R + 0.3) * np.sin(k * Z - 0.7)
+        ex = a[node] * (-2 * k * k * f[node]) + aR * fR + aZ * fZ
+        res = (D @ ((V @ a) * (G @ f)))[node]
+        errs.append(np.sqrt(np.mean((res - ex)[grid.interior] ** 2)))
+    assert np.log2(errs[0] / errs[1]) > 1.8, errs
