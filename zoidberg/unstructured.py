@@ -1224,6 +1224,15 @@ def som_weights(
         n_legs = next_leg
 
         rows = [None] * n_legs
+        # Small meshes (e.g. the 1D test grids) cannot provide the full
+        # stencil; use as many nodes as there are
+        n_min = min(grid.plane(j).n_nodes for j in range(ny))
+        if num_coefs(order) + extra > n_min:
+            warnings.warn(
+                f"Parallel-map stencils reduced to {n_min} nodes "
+                f"(mesh too small for num_coefs({order}) + {extra})"
+            )
+            extra = max(n_min - num_coefs(order), 0)
         # Stencils, computed per target plane in one batch
         for y in range(ny):
             yt = (y + sign) % ny
