@@ -1153,7 +1153,9 @@ def trace_maps(grid, field, rtol=1e-10, field_tracer=None, domain_tol=1e-9):
 # Parallel (support operator method) weights
 
 
-def som_weights(grid, maps, order=4, strict=True, snap_tol=1e-10):
+def som_weights(
+    grid, maps, order=4, strict=True, snap_tol=1e-10, extra=4, weight_power=0.0
+):
     """Cell numbering, leg metadata and CSR operators for ``PetscOperators``.
 
     Uses the numbering of :func:`zoidberg.weights.assign_cell_space_numbers`:
@@ -1224,7 +1226,12 @@ def som_weights(grid, maps, order=4, strict=True, snap_tol=1e-10):
                     (maps[f"{name}_R"][y, src], maps[f"{name}_Z"][y, src])
                 )
                 inds, w, info = target.lsq_weights(
-                    pos, order=order, strict=strict, snap_tol=snap_tol
+                    pos,
+                    order=order,
+                    extra=extra,
+                    weight_power=weight_power,
+                    strict=strict,
+                    snap_tol=snap_tol,
                 )
                 stats["fallback"] += info["fallback"]
                 stats["snapped"] += info["snapped"]
@@ -1766,6 +1773,8 @@ def build_grid_data(
     strict=True,
     rtol=1e-10,
     domain_tol=1e-9,
+    map_extra=4,
+    map_weight_power=0.0,
 ):
     """Compute every variable of the grid-file contract. Returns
     ``(data, stats)``.
@@ -1777,10 +1786,20 @@ def build_grid_data(
     ``dagp_order`` is the order of the face gradient/value fits of the
     perpendicular operator (order 4 with the larger stencils of
     :func:`_plane_dagp` gives robust second order and no growing modes on
-    the test grids). ``domain_tol``: see :func:`trace_maps`.
+    the test grids). ``domain_tol``: see :func:`trace_maps`. ``map_extra``
+    and ``map_weight_power`` set the stencil size (``num_coefs(map_order) +
+    map_extra`` nodes) and the distance weighting of the parallel-map fits
+    (see :meth:`UnstructuredPoloidalGrid.lsq_weights`).
     """
     maps = trace_maps(grid, field, rtol=rtol, domain_tol=domain_tol)
-    som, som_stats = som_weights(grid, maps, order=map_order, strict=strict)
+    som, som_stats = som_weights(
+        grid,
+        maps,
+        order=map_order,
+        strict=strict,
+        extra=map_extra,
+        weight_power=map_weight_power,
+    )
     dagp, dagp_stats = dagp_unstructured(
         grid,
         som["cell_number"],
