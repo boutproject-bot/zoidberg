@@ -119,6 +119,39 @@ def test_injection_snap():
     assert np.all(w[:, 0] == 1.0) and np.all(w[:, 1:] == 0.0)
 
 
+def test_injection_maps_in_grid_file(tmp_path):
+    # Straight field: every field line ends on a node of the next plane, so
+    # each interior map row written to the grid file must be an exact
+    # injection (one entry, weight 1.0) onto the node at the traced end point
+    pol = strip(nR=8, nZ=8)
+    field = zbfield.Slab(By=1.0, Bz=0.0, Bzprime=0.0)
+    _grid, d, _stats = us.make_unstructured_grid(
+        str(tmp_path / "g.nc"), pol, field, ny=4, Ly=10.0
+    )
+    cell = np.asarray(d["cell_number"])[..., 0]
+    R, Z = np.asarray(d["R"])[..., 0], np.asarray(d["Z"])[..., 0]
+    node = {int(c): xy for xy, c in np.ndenumerate(cell) if c >= 0}
+    ny = cell.shape[1]
+    for name, step in (("forward", 1), ("backward", -1)):
+        rows = np.asarray(d[f"{name}_rows"])
+        cols = np.asarray(d[f"{name}_columns"])
+        weights = np.asarray(d[f"{name}_weights"])
+        legs = np.asarray(d[f"{name}_leg_interior_number"])[..., 0]
+        tR, tZ = np.asarray(d[f"{name}_R"])[..., 0], np.asarray(d[f"{name}_Z"])[..., 0]
+        assert np.all(np.diff(rows) == 1)
+        assert np.all(weights == 1.0)
+        n_legs = 0
+        for (x, y), leg in np.ndenumerate(legs):
+            if leg < 0:
+                continue
+            n_legs += 1
+            xt, yt = node[int(cols[rows[leg]])]
+            assert yt == (y + step) % ny
+            assert R[xt, yt] == pytest.approx(tR[x, y], abs=1e-12)
+            assert Z[xt, yt] == pytest.approx(tZ[x, y], abs=1e-12)
+        assert n_legs == np.count_nonzero(cell >= 0)
+
+
 def test_dagp_laplacian_quadratic():
     # div(grad(R^2 + Z^2)) = 4, with a = 1, on a doubly periodic mesh using a
     # locally defined quadratic (minimum image from each node). Instead,
