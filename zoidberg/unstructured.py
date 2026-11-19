@@ -2190,6 +2190,13 @@ BOUT_MMS = {
 }
 
 
+# Isotropic variant of BOUT_MMS (same geometry and field): nR grows with n
+# (nR = n / nR_divisor), jitter in R and Z, so that the plane mesh is
+# isotropic at every resolution (BOUT_MMS keeps nR = 8 fixed, so its plane
+# mesh goes from anisotropic to isotropic within n = 8-64)
+BOUT_MMS_ISO = dict(BOUT_MMS, nR_divisor=8, nR_min=4, seed=2345)
+
+
 # Cylindrical test grids: pure toroidal field (Screwpinch without shear) on
 # an annulus R in [1, 2] with Dirichlet walls, periodic in Z (Lz = 1).
 BOUT_MMS_CYL = {"R0": 1.0, "Lx": 1.0, "Lz": 1.0, "ny": 4, "jitter": 0.2, "seed": 4321}
@@ -2237,6 +2244,8 @@ def make_test_grid(family, n, filename=None, **kwargs):
     """Shared entry point for test grids (used by BOUT-dev and Hermes-3).
 
     Families: ``"bout_mms"`` (MMS-spatial-fci-unstructured, Slab field),
+    ``"bout_mms_iso"`` (same geometry and field, nR = n/8 and jitter in R and
+    Z, so the plane mesh is isotropic at every n),
     ``"bout_mms_cyl"`` (cylindrical case of that test, toroidal field) and
     ``"bout_mms_cyl_sheared"`` (cylindrical, sheared field, ``n`` planes; for
     the parallel operators). Other families are built by the callers with
@@ -2296,6 +2305,26 @@ def make_test_grid(family, n, filename=None, **kwargs):
             yperiodic=True,
             dirichlet_walls=True,
         )
+    if family == "bout_mms_iso":
+        p = dict(BOUT_MMS_ISO, **kwargs)
+        pol = UnstructuredPoloidalGrid.slab(
+            max(p["nR_min"], n // p["nR_divisor"]),
+            n,
+            p["Lx"],
+            p["Lz"],
+            R0=p["R0"],
+            Z0=p["Z0"],
+            jitter=p["jitter"],
+            jitter_dirs="rz",
+            periodic_R=False,
+            periodic_Z=True,
+            seed=p["seed"] + n,
+            r_on_walls=True,
+        )
+        field = Slab(Bz=0.05, Bzprime=0.1)
+        return make_unstructured_grid(
+            filename, pol, field, ny=n, Ly=p["Ly"], yperiodic=True
+        )
     if family != "bout_mms":
         raise ValueError(f"Unknown test-grid family '{family}'")
     p = dict(BOUT_MMS, **kwargs)
@@ -2322,6 +2351,7 @@ __all__ = [
     "BOUT_MMS",
     "BOUT_MMS_CYL",
     "BOUT_MMS_CYL_SHEARED",
+    "BOUT_MMS_ISO",
     "ShearedCylinderField",
     "StencilFallbackWarning",
     "UnstructuredGrid",

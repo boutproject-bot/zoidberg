@@ -181,6 +181,27 @@ def test_bout_mms_grids_no_fallback():
         assert stats["forward_hits"] == 0 and stats["backward_hits"] == 0
 
 
+def test_bout_mms_iso_grids():
+    # Isotropic family: nR = n/8 (at least 4), jitter in R and Z, nodes on the
+    # R walls; no stencil fallbacks, no growing modes, no wall hits
+    for n in (32, 48):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", us.StencilFallbackWarning)
+            grid, _data, stats = us.make_test_grid("bout_mms_iso", n, filename=None)
+        pol = grid.plane(0)
+        R = np.unique(np.round(pol.R, 12))
+        p = us.BOUT_MMS_ISO
+        assert np.isclose(pol.R.min(), p["R0"]) and np.isclose(
+            pol.R.max(), p["R0"] + p["Lx"]
+        )
+        # interior nodes are jittered in R (not on nR fixed lines)
+        assert len(R) > max(4, n // 8)
+        assert pol.n_nodes == max(4, n // 8) * n
+        assert stats["som"]["fallback"] == 0 and stats["dagp"]["fallback"] == 0
+        assert stats["dagp"]["max_re"] <= 1e-10
+        assert stats["forward_hits"] == 0 and stats["backward_hits"] == 0
+
+
 def test_contract_variables_finite(tmp_path):
     pol = strip(nR=8, nZ=8)
     field = zbfield.Slab(Bz=0.05, Bzprime=0.1)
