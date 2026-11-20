@@ -17,9 +17,11 @@ Layout ("nodes along x")
     are written to the file. The ``MXG`` guard cells on either side are padding.
     Their ``cell_number`` is ``-1``, so no unstructured operator ever
     references them. Their geometric fields are copies of the nearest
-    node, so all values are finite. ``n_nodes`` must be a multiple of
-    ``multiple_of`` (default 4) so that ``NXPE`` in {1, 2, 4} divides the
-    interior. Nodes are sorted in Morton (Z-order) to improve locality.
+    node, so all values are finite. BOUT++ splits the evolving nodes evenly
+    between the ``NXPE`` processors in x, so ``NXPE`` must divide their
+    number. With the default ``multiple_of`` = 4, NXPE in {1, 2, 4} always
+    works; other counts only give a warning with the valid ``NXPE`` values.
+    Nodes are sorted in Morton (Z-order) to improve locality.
 
 Dirichlet walls (optional, ``dirichlet_walls=True``)
     The wall nodes are stored in the x guard cells instead: inner-wall nodes
@@ -1065,8 +1067,17 @@ class UnstructuredGrid:
         self.n_nodes = n.pop()
         self._layout()
         if self.n_interior % self.multiple_of != 0:
-            raise ValueError(
-                f"{self.n_interior} evolving nodes is not a multiple of {self.multiple_of}"
+            # Only a restriction of the processor split: BOUT++ needs NXPE to
+            # divide the number of evolving nodes (and checks it at start-up)
+            valid = [d for d in range(1, 129) if self.n_interior % d == 0]
+            warnings.warn(
+                f"{self.n_interior} evolving nodes is not a multiple of "
+                f"{self.multiple_of}: BOUT++ can only use NXPE in {valid} "
+                "(NXPE must divide the number of evolving nodes). To allow "
+                f"NXPE = {self.multiple_of}, mesh with "
+                f"gmsh_planes(..., multiple_of={self.multiple_of}, "
+                f"dirichlet_walls={self.dirichlet_walls})",
+                stacklevel=2,
             )
         if self.MYG != 1:
             raise ValueError("Only MYG = 1 is supported for unstructured grids")
@@ -3047,6 +3058,7 @@ def gmsh_planes(
     relax=False,
     multiple_of=4,
     centroid_dofs=True,
+    dirichlet_walls=True,
 ):
     """Mesh every poloidal cross-section independently with gmsh.
 
@@ -3057,8 +3069,11 @@ def gmsh_planes(
     longest curve of all planes; the planes are meshed, and those with fewer
     nodes than the largest are re-meshed with the missing nodes added in
     their largest triangles. The total is rounded up so that the number of
-    evolving (non-wall) nodes is a multiple of ``multiple_of``. ``relax``
-    and ``centroid_dofs``: see :meth:`UnstructuredPoloidalGrid.from_gmsh`.
+    evolving nodes is a multiple of ``multiple_of``: the non-wall nodes with
+    ``dirichlet_walls=True`` (the default; the wall nodes then go into the x
+    guard cells), all nodes with ``dirichlet_walls=False``. Pass the same
+    ``dirichlet_walls`` as to :class:`UnstructuredGrid`. ``relax`` and
+    ``centroid_dofs``: see :meth:`UnstructuredPoloidalGrid.from_gmsh`.
     """
     ny = len(outers)
     if inners is None:
@@ -3073,7 +3088,7 @@ def gmsh_planes(
         UnstructuredPoloidalGrid.from_gmsh(o, i, relax=False, **kw)
         for o, i in zip(outers, inners)
     ]
-    n_walls = n_outer + (n_inner or 0)
+    n_walls = n_outer + (n_inner or 0) if dirichlet_walls else 0
     target = max(p.n_nodes for p in planes)
     target += -(target - n_walls) % multiple_of
     planes = [

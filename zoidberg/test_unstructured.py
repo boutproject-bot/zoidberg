@@ -624,6 +624,27 @@ def test_gmsh_planes_equal_counts():
         p._check_orientation()
 
 
+def test_gmsh_planes_node_count_without_dirichlet_walls():
+    # Without Dirichlet walls all nodes evolve: gmsh_planes rounds the total
+    # (not only the non-wall nodes) to multiple_of
+    pytest.importorskip("gmsh")
+    shapes = [_curved_annulus(shift) for shift in (0.0, 0.03)]
+    outers, inners = [o for o, _ in shapes], [i for _, i in shapes]
+    planes = us.gmsh_planes(outers, inners, mesh_size=1 / 16, dirichlet_walls=False)
+    grid = us.UnstructuredGrid(planes, np.arange(2.0), 2.0, dirichlet_walls=False)
+    assert grid.n_interior == planes[0].n_nodes
+    assert grid.n_interior % 4 == 0
+
+
+def test_node_count_not_multiple_only_warns():
+    # A node count that is not a multiple of multiple_of only restricts NXPE:
+    # the grid is built, with a warning listing the valid NXPE
+    pol = strip(nR=5, nZ=5)  # 25 nodes
+    with pytest.warns(UserWarning, match="NXPE in \\[1, 5, 25\\]"):
+        grid = us.UnstructuredGrid(pol, np.array([0.0]), 1.0, multiple_of=4)
+    assert grid.n_interior == 25
+
+
 def _plane_laplacian_error(pol):
     from scipy.sparse import csr_matrix
 
