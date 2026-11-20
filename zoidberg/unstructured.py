@@ -2100,7 +2100,7 @@ def _periodic_shifts(pol):
     return np.array(shifts)
 
 
-def _k2_pieces(src, td, od, chunk=200000):
+def _k2_pieces(src, td, od, chunk=50000):
     """Overlaps of the dual cells of ``src`` with the destination dual
     triangles ``td`` (owners ``od``), which are already pulled back into the
     source plane.
@@ -2365,27 +2365,34 @@ def _k2_pair_task(task):
     o = np.concatenate([o, rsrc])
     k = np.concatenate([k, land[rsrc]])
     mom = np.concatenate([mom, res[rsrc]])
-    # --- Deposit and own face
+    # --- Deposit and own face (in chunks of pieces, merging duplicate
+    # entries per chunk, to bound the memory of the padded stencils)
     kk = nb.shape[1]
-    coef = np.einsum("pc,pck->pk", _k2_basis_moments(mom), P[o])
-    T = (
-        np.concatenate([k, np.repeat(k, kk)]),
-        np.concatenate([o, nb[o].ravel()]),
-        np.concatenate([mom[:, 0] - coef.sum(1), coef.ravel()]),
-    )
-    cc = np.einsum("pc,pck->pk", _k2_basis_moments(cellmom[rsrc]), P[rsrc])
-    Own = (
-        np.concatenate([rsrc, np.repeat(rsrc, kk)]),
-        np.concatenate([rsrc, nb[rsrc].ravel()]),
-        np.concatenate([cellmom[rsrc, 0] - cc.sum(1), cc.ravel()]),
-    )
 
-    def merged(trip, n_rows, n_cols):
-        r, c, v = trip
+    def merged(r, c, v, n_rows):
         keep = v != 0.0
         ptr, cols, vals = _csr(n_rows, r[keep], c[keep], v[keep])
-        rows = np.repeat(np.arange(n_rows), np.diff(ptr))
-        return rows, cols, vals
+        return np.repeat(np.arange(n_rows), np.diff(ptr)), cols, vals
+
+    def deposit(rows, src_nodes, m, n_rows, chunk=20000):
+        parts = []
+        for c0 in range(0, len(rows), chunk):
+            r_, o_, m_ = (a[c0 : c0 + chunk] for a in (rows, src_nodes, m))
+            coef = np.einsum("pc,pck->pk", _k2_basis_moments(m_), P[o_])
+            parts.append(
+                merged(
+                    np.concatenate([r_, np.repeat(r_, kk)]),
+                    np.concatenate([o_, nb[o_].ravel()]),
+                    np.concatenate([m_[:, 0] - coef.sum(1), coef.ravel()]),
+                    n_rows,
+                )
+            )
+        if not parts:
+            return np.zeros(0, int), np.zeros(0, int), np.zeros(0)
+        return merged(*(np.concatenate(x) for x in zip(*parts)), n_rows)
+
+    T = deposit(k, o, mom, n_dst)
+    Own = deposit(rsrc, rsrc, cellmom[rsrc], n_src)
 
     stats = {
         "pieces": int(len(o) - len(rsrc)),
@@ -2399,7 +2406,7 @@ def _k2_pair_task(task):
         "reconstruction_error": check,
         "time": __import__("time").time() - t0,
     }
-    return merged(T, n_dst, n_src), merged(Own, n_src, n_src), stats
+    return T, Own, stats
 
 
 def _k2_vertices(pol, tri):
@@ -2424,6 +2431,7 @@ def k2_divergence(
     tube_volume="auto",
     rtol=1e-10,
     max_cond=1e6,
+    refine_tol=1e-3,
     processes=1,
     pullback=None,
 ):
@@ -2474,8 +2482,10 @@ def k2_divergence(
     const. ``refine``: the destination dual triangles are split into
     ``4**refine`` triangles before their vertices are traced back
     (piecewise-linear image of the curved cells); ``"auto"`` uses 0 if the
-    maps are affine (traced edge midpoints within 1e-8 node spacings of the
-    midpoints of the traced vertices) and 1 otherwise. ``tube_volume``:
+    maps are nearly affine (the traced midpoints of the triangle edges lie
+    within ``refine_tol`` node spacings of the midpoints of the traced
+    vertices, so that the straight-edged image misplaces at most about that
+    fraction of a cell; exactly affine maps give round-off) and 1 otherwise. ``tube_volume``:
     ``"dV"`` (``V_tube = dV`` of the source cell, exact for area-preserving
     maps), ``"B"`` (``A B_n integral(ds/|B|)`` along the leg, Simpson rule
     with the traced half point, for fields whose ``B_y`` changes along the
@@ -2614,7 +2624,7 @@ def k2_divergence(
         pulled.append((tdp, od))
     t_trace = time.time() - t_trace
     if refine == "auto":
-        levels = 0 if max_dev < 1e-8 else 1
+        levels = 0 if max_dev < refine_tol else 1
         if levels == 0:
             # Parent triangles: vertices a, b, c of the children
             new = []
