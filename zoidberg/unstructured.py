@@ -1964,6 +1964,857 @@ def slab_metric(grid, field, maps, volume):
 
 
 # ----------------------------------------------------------------------
+# Flux-reconstructed conservative parallel half-divergences ("K2")
+
+#: Version of the K2 matrices in the grid file (``k2_version``)
+K2_VERSION = 1
+
+
+def _tri_area_signed(t):
+    """Signed areas of triangles ``t[..., 3, 2]``."""
+    a = t[..., 1, :] - t[..., 0, :]
+    b = t[..., 2, :] - t[..., 0, :]
+    return 0.5 * (a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0])
+
+
+def _dual_triangles(pol):
+    """Two triangles per dual face: ``(node i, start, end)`` owned by ``i``
+    and ``(node j, end, start)`` owned by ``j``, counter-clockwise, unwrapped
+    near the owning node. Their union per node is its dual cell. Returns
+    ``(tri (N, 3, 2), owner (N,))``."""
+    fc = pol.faces()
+    pts = pol.points
+    s, e = fc["start"], fc["end"]
+    i, j = fc["i"], fc["j"]
+    xj = pol.minimum_image(pts[j] - pts[i])
+    pi = pts[i]
+    t1 = np.stack([pi, pi + s, pi + e], axis=1)
+    pj = pi + xj
+    t2 = np.stack([pj, pi + e, pi + s], axis=1)
+    tri = np.concatenate([t1, t2])
+    own = np.concatenate([i, j])
+    a = _tri_area_signed(tri)
+    flip = a < 0
+    tri[flip] = tri[flip][:, ::-1]
+    keep = np.abs(a) > 1e-300
+    return tri[keep], own[keep]
+
+
+def _refine_triangles(tri, own, levels):
+    """Split every triangle into ``4**levels`` similar triangles."""
+    for _ in range(levels):
+        a, b, c = tri[:, 0], tri[:, 1], tri[:, 2]
+        ab, bc, ca = 0.5 * (a + b), 0.5 * (b + c), 0.5 * (c + a)
+        tri = np.concatenate(
+            [
+                np.stack([a, ab, ca], 1),
+                np.stack([ab, b, bc], 1),
+                np.stack([ca, bc, c], 1),
+                np.stack([ab, bc, ca], 1),
+            ]
+        )
+        own = np.tile(own, 4)
+    return tri, own
+
+
+def _clip_tri_tri(S, D):
+    """Intersection polygons of the counter-clockwise triangles ``S[m]`` and
+    ``D[m]`` (vectorised Sutherland-Hodgman). Returns ``(P (M, 9, 2), cnt)``:
+    the vertices, padded with the first one (so that the padding edges have
+    zero length)."""
+    M = len(S)
+    maxv = 9
+    P = np.zeros((M, maxv, 2))
+    P[:, :3] = S
+    cnt = np.full(M, 3)
+    idx = np.arange(maxv)
+    for e in range(3):
+        a = D[:, e]
+        ed = D[:, (e + 1) % 3] - a
+        valid = idx[None, :] < cnt[:, None]
+        # Signed distance, >= 0 inside the (counter-clockwise) clip triangle
+        dist = ed[:, None, 0] * (P[..., 1] - a[:, None, 1]) - ed[:, None, 1] * (
+            P[..., 0] - a[:, None, 0]
+        )
+        nxt = (idx[None, :] + 1) % np.maximum(cnt[:, None], 1)
+        Pn = np.take_along_axis(P, nxt[..., None].repeat(2, axis=2), axis=1)
+        dn = np.take_along_axis(dist, nxt, axis=1)
+        inside = dist >= 0
+        cross = valid & (inside != (dn >= 0))
+        t = np.where(cross, dist / np.where(cross, dist - dn, 1.0), 0.0)
+        X = P + t[..., None] * (Pn - P)
+        # Emit the current vertex if inside, then the crossing point
+        out = np.zeros((M, 2 * maxv, 2))
+        keep = np.zeros((M, 2 * maxv), dtype=bool)
+        out[:, 0::2] = P
+        out[:, 1::2] = X
+        keep[:, 0::2] = valid & inside
+        keep[:, 1::2] = cross
+        order = np.argsort(~keep, axis=1, kind="stable")
+        P = np.take_along_axis(out, order[..., None].repeat(2, axis=2), axis=1)[
+            :, :maxv
+        ]
+        cnt = np.minimum(keep.sum(axis=1), maxv)
+    pad = idx[None, :] >= cnt[:, None]
+    P = np.where(pad[..., None], P[:, :1], P)
+    return P, cnt
+
+
+def _poly_moments(P):
+    """Exact moments ``[A, Mx, My, Mxx, Mxy, Myy]`` of the polygons
+    ``P (M, V, 2)`` (counter-clockwise, padded with the first vertex)."""
+    x, y = P[..., 0], P[..., 1]
+    xn, yn = np.roll(x, -1, axis=1), np.roll(y, -1, axis=1)
+    c = x * yn - xn * y
+    return np.column_stack(
+        [
+            0.5 * c.sum(1),
+            (c * (x + xn)).sum(1) / 6.0,
+            (c * (y + yn)).sum(1) / 6.0,
+            (c * (x * x + x * xn + xn * xn)).sum(1) / 12.0,
+            (c * (x * yn + 2 * x * y + 2 * xn * yn + xn * y)).sum(1) / 24.0,
+            (c * (y * y + y * yn + yn * yn)).sum(1) / 12.0,
+        ]
+    )
+
+
+def _k2_cell_moments(pol):
+    """Moments of every dual cell relative to its unknown (dof)."""
+    t, o = _dual_triangles(pol)
+    rel0 = pol.minimum_image(t[:, 0] - pol.dof[o])
+    m = _poly_moments(t - t[:, :1] + rel0[:, None])
+    out = np.zeros((pol.n_nodes, 6))
+    np.add.at(out, o, m)
+    return out
+
+
+def _periodic_shifts(pol):
+    """Translations by -1, 0, +1 periods in each periodic direction."""
+    shifts = [np.zeros(2)]
+    for dim in range(2):
+        p = pol.period[dim]
+        if np.isfinite(p):
+            unit = np.zeros(2)
+            unit[dim] = p
+            shifts = [s + k * unit for s in shifts for k in (-1.0, 0.0, 1.0)]
+    return np.array(shifts)
+
+
+def _k2_pieces(src, td, od, chunk=200000):
+    """Overlaps of the dual cells of ``src`` with the destination dual
+    triangles ``td`` (owners ``od``), which are already pulled back into the
+    source plane.
+
+    Returns ``(o, k, mom, contains, pulled_area)``: source node, destination
+    node, moments of each piece relative to the source dof, whether the
+    piece contains the source dof, and the pulled-back area of every
+    destination cell.
+    """
+    import shapely
+
+    ts, os_ = _dual_triangles(src)
+    td = np.array(td, dtype=float, copy=True)
+    a = _tri_area_signed(td)
+    pulled_area = np.bincount(od, weights=np.abs(a), minlength=int(od.max()) + 1)
+    flip = a < 0
+    td[flip] = td[flip][:, ::-1]
+    # Wrap each pulled-back triangle into the periodic box by its first
+    # vertex, then add the periodic copies
+    wrapped0 = src.wrap(td[:, 0])
+    td += (wrapped0 - td[:, 0])[:, None, :]
+    shifts = _periodic_shifts(src)
+    td = np.concatenate([td + s for s in shifts])
+    od = np.tile(od, len(shifts))
+    bs = shapely.box(
+        ts[..., 0].min(1), ts[..., 1].min(1), ts[..., 0].max(1), ts[..., 1].max(1)
+    )
+    bd = shapely.box(
+        td[..., 0].min(1), td[..., 1].min(1), td[..., 0].max(1), td[..., 1].max(1)
+    )
+    ii, kk = shapely.STRtree(bd).query(bs)
+    del bs, bd
+    X = src.dof
+    outo, outk, outm, outc = [], [], [], []
+    for c0 in range(0, len(ii), chunk):
+        i_, k_ = ii[c0 : c0 + chunk], kk[c0 : c0 + chunk]
+        o = os_[i_]
+        # Coordinates relative to the source dof
+        rel0 = src.minimum_image(ts[i_, 0] - X[o])
+        S = ts[i_] - ts[i_, :1] + rel0[:, None]
+        D = td[k_] - ts[i_, :1] + rel0[:, None]
+        P, cnt = _clip_tri_tri(S, D)
+        m = _poly_moments(P)
+        good = (cnt >= 3) & (m[:, 0] > 1e-14 * np.abs(_tri_area_signed(S)))
+        # The pieces are convex: the dof (origin) is inside if it is on the
+        # left of every edge
+        Pn = np.roll(P, -1, axis=1)
+        crs = P[..., 0] * Pn[..., 1] - P[..., 1] * Pn[..., 0]
+        contains = np.all(crs >= 0, axis=1)
+        outo.append(o[good])
+        outk.append(od[k_][good])
+        outm.append(m[good])
+        outc.append(contains[good])
+    if not outo:
+        return (
+            np.zeros(0, int),
+            np.zeros(0, int),
+            np.zeros((0, 6)),
+            np.zeros(0, bool),
+            pulled_area,
+        )
+    return (
+        np.concatenate(outo),
+        np.concatenate(outk),
+        np.concatenate(outm),
+        np.concatenate(outc),
+        pulled_area,
+    )
+
+
+def _k2_reconstruction(pol, candidates, order, max_cond=1e6):
+    """Weighted least-squares reconstruction of a density around each dof
+    from the densities of the ``candidates`` (boolean mask: nodes whose leg
+    in this direction is interior).
+
+    For order 2 ("quadF") the fit is quadratic, with the value fixed at the
+    dof, over the 14 nearest candidates; order 1 ("lin") is linear over 8.
+    Distances are Euclidean (minimum image), weights ``1/(d^2/<d^2> + 0.1)``.
+    A stencil whose scaled least-squares matrix has a condition number
+    above ``max_cond`` grows (k, k+6, k+14 neighbours), then drops to the
+    next lower order, and finally to a constant (no correction).
+
+    Returns ``(nb (n, kmax), P (n, 5, kmax), used_order (n,))``: neighbour
+    node indices and the weights of the coefficients ``[d/dR, d/dZ,
+    d2/dR2, d2/dRdZ, d2/dZ2]`` applied to ``rho_nb - rho_dof``. Only rows
+    of candidate nodes are filled (others: order -1).
+    """
+    from scipy.spatial import cKDTree
+
+    n = pol.n_nodes
+    cand = np.flatnonzero(candidates)
+    nc = len(cand)
+    sizes = {2: 14, 1: 8}
+    kmax = 0
+    attempts = []
+    for p in range(order, 0, -1):
+        for kk in (sizes[p], sizes[p] + 6, sizes[p] + 14):
+            if kk <= nc - 1 and num_coefs(p) - 1 <= kk:
+                attempts.append((p, kk))
+                kmax = max(kmax, kk)
+    nb = np.repeat(np.arange(n)[:, None], max(kmax, 1), axis=1)
+    P = np.zeros((n, 5, max(kmax, 1)))
+    used = np.full(n, -1)
+    if nc == 0:
+        return nb, P, used
+    used[cand] = 0
+    if kmax == 0:
+        return nb, P, used
+    X = pol.dof
+    shifts = _periodic_shifts(pol)
+    big = np.concatenate([X[cand] + s for s in shifts])
+    tree = cKDTree(big)
+    dist, idx = tree.query(X[cand], kmax + 1)
+    if np.any(dist[:, 0] > 0):
+        raise AssertionError("K2 reconstruction: the dof is not its own neighbour")
+    idx = idx[:, 1:]
+    r = big[idx] - X[cand][:, None, :]
+    nbr = cand[idx % nc]
+    done = np.zeros(nc, dtype=bool)
+    for p, kk in attempts:
+        todo = np.flatnonzero(~done)
+        if len(todo) == 0:
+            break
+        rr = r[todo, :kk]
+        d2 = np.sum(rr**2, axis=-1)
+        h2 = np.mean(d2, axis=1, keepdims=True)
+        w = 1.0 / (d2 / h2 + 0.1)
+        s = np.sqrt(h2)[..., None]
+        u = rr / s
+        cols = [u[..., 0], u[..., 1]]
+        if p == 2:
+            cols += [0.5 * u[..., 0] ** 2, u[..., 0] * u[..., 1], 0.5 * u[..., 1] ** 2]
+        A = np.stack(cols, axis=-1) * w[..., None]
+        su, sv, svt = np.linalg.svd(A, full_matrices=False)
+        cond = sv[:, 0] / np.maximum(sv[:, -1], 1e-300)
+        good = cond <= max_cond
+        if not np.any(good):
+            continue
+        Pk = _pinv_from_svd(su[good], sv[good], svt[good]) * w[good][:, None, :]
+        sg = np.sqrt(h2[good])  # (m, 1)
+        Pk[:, :2] /= sg[..., None]
+        if p == 2:
+            Pk[:, 2:] /= (sg**2)[..., None]
+        rows = cand[todo[good]]
+        nb[rows, :kk] = nbr[todo[good], :kk]
+        nb[rows, kk:] = rows[:, None]
+        P[rows, :, :] = 0.0
+        P[rows, : Pk.shape[1], :kk] = Pk
+        used[rows] = p
+        done[todo[good]] = True
+    return nb, P, used
+
+
+def _k2_basis_moments(m):
+    """Integrals of the basis ``[dR, dZ, dR^2/2, dR dZ, dZ^2/2]`` over
+    regions with moments ``m`` (relative to the dof)."""
+    return np.column_stack([m[:, 1], m[:, 2], 0.5 * m[:, 3], m[:, 4], 0.5 * m[:, 5]])
+
+
+def _k2_check_reconstruction(pol, nb, P, used, seed=0):
+    """Self-check: the reconstruction is exact for a random quadratic
+    (order-2 rows) or linear (order-1 rows) density. Returns the largest
+    scaled error."""
+    rng = np.random.default_rng(seed)
+    worst = 0.0
+    for p in (1, 2):
+        rows = np.flatnonzero(used == p)
+        if len(rows) == 0:
+            continue
+        r = pol.minimum_image(pol.dof[nb[rows]] - pol.dof[rows][:, None, :])
+        h = np.sqrt(np.mean(np.sum(r**2, axis=-1), axis=1))
+        g = rng.standard_normal((len(rows), 2)) / h[:, None]
+        H = np.zeros((len(rows), 3))
+        if p == 2:
+            H = rng.standard_normal((len(rows), 3)) / (h**2)[:, None]
+        drho = g[:, None, 0] * r[..., 0] + g[:, None, 1] * r[..., 1]
+        drho += (
+            0.5 * H[:, None, 0] * r[..., 0] ** 2
+            + H[:, None, 1] * r[..., 0] * r[..., 1]
+            + 0.5 * H[:, None, 2] * r[..., 1] ** 2
+        )
+        coef = np.einsum("pck,pk->pc", P[rows], drho)
+        err = np.abs(coef[:, :2] - g) * h[:, None]
+        worst = max(worst, float(err.max()))
+        if p == 2:
+            errq = np.abs(coef[:, 2:] - H) * (h**2)[:, None]
+            worst = max(worst, float(errq.max()))
+    return worst
+
+
+def _k2_pair_task(task):
+    """Pieces, reconstruction and local deposit/own-face matrices of one
+    plane pair and direction (run in a worker process or inline).
+
+    Returns local triplets: ``T`` (destination node, source node, value),
+    the flux deposited into the destination cells from the source
+    densities, and ``Own`` (source node, source node, value), the integral
+    of each tube's reconstruction over its own source cell; and statistics.
+    """
+    src, dst = task["src"], task["dst"]
+    interior = task["interior"]  # source nodes with an interior leg
+    order = task["order"]
+    t0 = __import__("time").time()
+    o, k, mom, contains, pulled_area = _k2_pieces(src, task["td"], task["od"])
+    n_src, n_dst = src.n_nodes, dst.n_nodes
+    cellmom = _k2_cell_moments(src)
+    # --- Self-check: partition of the areas (no overlaps; full coverage
+    # wherever the tubes do not leave the mesh)
+    a_src = np.bincount(o, weights=mom[:, 0], minlength=n_src)
+    a_dst = np.bincount(k, weights=mom[:, 0], minlength=n_dst)
+    pulled_area = np.concatenate(
+        [pulled_area, np.zeros(max(0, n_dst - len(pulled_area)))]
+    )
+    def_src = (cellmom[:, 0] - a_src) / cellmom[:, 0]
+    def_dst = (pulled_area - a_dst) / np.maximum(pulled_area, 1e-300)
+    tol = 1e-12
+    if def_src.min() < -tol or def_dst.min() < -tol:
+        raise AssertionError(
+            "K2 overlaps: pieces overlap (area sums exceed the cell areas by "
+            f"{-def_src.min():.2e} (source) / {-def_dst.min():.2e} (destination))"
+        )
+    # --- Reconstruction (interior-leg cells only)
+    if order >= 1:
+        nb, P, used = _k2_reconstruction(
+            src, interior, order, max_cond=task["max_cond"]
+        )
+        check = _k2_check_reconstruction(src, nb, P, used, seed=task["seed"])
+        if check > 1e-8:
+            raise AssertionError(f"K2 reconstruction not exact: error {check:.2e}")
+    else:
+        nb = np.repeat(np.arange(n_src)[:, None], 1, axis=1)
+        P = np.zeros((n_src, 5, 1))
+        used = np.where(interior, 0, -1)
+        check = 0.0
+    # --- Pieces of interior-leg tubes; the part of a tube outside the
+    # destination mesh (the cell moments minus the pieces) goes to the
+    # destination cell that contains the landing point of the field line
+    sel = interior[o]
+    o, k, mom, contains = o[sel], k[sel], mom[sel], contains[sel]
+    res = (
+        cellmom
+        - np.array(
+            [np.bincount(o, weights=mom[:, c], minlength=n_src) for c in range(6)]
+        ).T
+    )
+    land = np.full(n_src, -1)
+    if len(o):
+        # Piece containing the dof (largest if several), else the largest
+        score = mom[:, 0] + np.where(contains, 1e300, 0.0)
+        best = np.lexsort((-score, o))
+        first = np.ones(len(best), dtype=bool)
+        first[1:] = o[best][1:] != o[best][:-1]
+        land[o[best][first]] = k[best][first]
+    missing = np.flatnonzero(interior & (land < 0))
+    if len(missing):
+        # The tube misses the destination mesh entirely: nearest node to
+        # the landing point
+        lp = task["landing"][missing]
+        d = dst.minimum_image(dst.dof[None, :, :] - lp[:, None, :])
+        land[missing] = np.argmin(np.sum(d**2, axis=-1), axis=1)
+    rsrc = np.flatnonzero(interior)
+    o = np.concatenate([o, rsrc])
+    k = np.concatenate([k, land[rsrc]])
+    mom = np.concatenate([mom, res[rsrc]])
+    # --- Deposit and own face
+    kk = nb.shape[1]
+    coef = np.einsum("pc,pck->pk", _k2_basis_moments(mom), P[o])
+    T = (
+        np.concatenate([k, np.repeat(k, kk)]),
+        np.concatenate([o, nb[o].ravel()]),
+        np.concatenate([mom[:, 0] - coef.sum(1), coef.ravel()]),
+    )
+    cc = np.einsum("pc,pck->pk", _k2_basis_moments(cellmom[rsrc]), P[rsrc])
+    Own = (
+        np.concatenate([rsrc, np.repeat(rsrc, kk)]),
+        np.concatenate([rsrc, nb[rsrc].ravel()]),
+        np.concatenate([cellmom[rsrc, 0] - cc.sum(1), cc.ravel()]),
+    )
+
+    def merged(trip, n_rows, n_cols):
+        r, c, v = trip
+        keep = v != 0.0
+        ptr, cols, vals = _csr(n_rows, r[keep], c[keep], v[keep])
+        rows = np.repeat(np.arange(n_rows), np.diff(ptr))
+        return rows, cols, vals
+
+    stats = {
+        "pieces": int(len(o) - len(rsrc)),
+        "max_deficit_src": float(def_src[interior].max()) if interior.any() else 0.0,
+        "n_deficit_src": int(np.sum(def_src[interior] > tol)),
+        "max_deficit_dst": float(def_dst.max()) if n_dst else 0.0,
+        "n_deficit_dst": int(np.sum(def_dst > tol)),
+        "order_counts": {
+            int(p): int(np.sum(used == p)) for p in np.unique(used[interior])
+        },
+        "reconstruction_error": check,
+        "time": __import__("time").time() - t0,
+    }
+    return merged(T, n_dst, n_src), merged(Own, n_src, n_src), stats
+
+
+def _k2_vertices(pol, tri):
+    """Unique (wrapped) vertices of the triangles ``tri`` and, for every
+    vertex of ``tri``, its index in that list. Copies of one vertex (shared
+    by several triangles or periodic images) get the same index, so they
+    are traced once and map identically."""
+    pts = tri.reshape(-1, 2)
+    w = pol.wrap(pts)
+    key = np.round((w - pol.origin) / (1e-9 * pol.h)).astype(np.int64)
+    _, first, inverse = np.unique(key, axis=0, return_index=True, return_inverse=True)
+    return w[first], inverse.ravel()
+
+
+def k2_divergence(
+    grid,
+    field,
+    maps,
+    data,
+    order=2,
+    refine="auto",
+    tube_volume="auto",
+    rtol=1e-10,
+    max_cond=1e6,
+    processes=1,
+    pullback=None,
+):
+    """Flux-reconstructed conservative parallel half-divergences ("K2").
+
+    Computes the grid variables ``k2_forward_rows/columns/weights`` and
+    ``k2_backward_rows/columns/weights`` (CSR, ``total_cells`` rows in
+    stored cell numbers, columns in stored forward/backward **leg**
+    numbers) and the scalars ``k2_order`` and ``k2_version``.
+
+    ``data`` must hold the variables of :func:`som_weights` (cell and leg
+    numbering, ``forward_rows/columns/weights``), the metric (``dy``,
+    ``g_22``) and ``dagp_us_volume``; ``maps`` is the output of
+    :func:`trace_maps`.
+
+    Convention (drop-in replacement of BOUT++'s ``Div_minus``/``Div_plus``
+    of ``PetscOperators::getParallel``). With ``dV = dy*dagp_us_volume``,
+    ``dl = dy*sqrt(g_22)``, the leg spacing ``dl+ = Interp_plus(dl)`` (as in
+    BOUT++: ``(dl_i + sum_c F_lc dl_c)/2`` for an interior leg, ``dl_i`` for
+    a boundary leg) and a leg flux ``q`` (``K_plus*Grad_plus f``),
+    ``(D_f q)_c`` approximates the forward half of ``div(q b)`` in cell
+    ``c``, exactly where ``Div_minus`` does::
+
+        D_f = dV^-1 (Own_f - T_f) diag(V_tube / (dl+ A))
+        D_b = dV^-1 (T_b - Own_b) diag(V_tube / (dl- A))
+
+    ``q V_tube/(dl A)`` is the flux density on the source plane (``A`` the
+    planar dual-cell area); ``T`` integrates its reconstruction around each
+    source dof over the overlaps of the source cell with the destination
+    cells (pulled back to the source plane), ``Own`` over the source cell.
+    So the column of an interior leg sums to zero with weights ``dV``
+    (exact conservation), and a leg flux that is constant across the tubes
+    gives ``+q/dl`` in the source cell like ``Div_minus``.
+
+    **Boundary legs** (field line leaves the mesh) have the same column as
+    in ``Div_minus``/``Div_plus``: ``+1/dl+`` (``D_f``) or ``-1/dl-``
+    (``D_b``) in the row of the source cell and the opposite value in the
+    row of its parallel-boundary virtual cell. Their tubes are not deposited
+    and their densities do not enter any reconstruction, so the factor-2
+    boundary weight and the ``Interior_plus`` mask of
+    ``Div_par_K_Grad_par`` apply unchanged. A tube with an interior leg
+    that partly leaves the destination mesh deposits the outside part into
+    the destination cell containing its landing point (conservative).
+    Dirichlet wall nodes (no legs) carry no tube; deposits into them stay
+    in their rows, as with the support operators.
+
+    ``order``: 2 = quadF (quadratic reconstruction, default), 1 = lin, 0 =
+    const. ``refine``: the destination dual triangles are split into
+    ``4**refine`` triangles before their vertices are traced back
+    (piecewise-linear image of the curved cells); ``"auto"`` uses 0 if the
+    maps are affine (traced edge midpoints within 1e-8 node spacings of the
+    midpoints of the traced vertices) and 1 otherwise. ``tube_volume``:
+    ``"dV"`` (``V_tube = dV`` of the source cell, exact for area-preserving
+    maps), ``"B"`` (``A B_n integral(ds/|B|)`` along the leg, Simpson rule
+    with the traced half point, for fields whose ``B_y`` changes along the
+    field lines) or ``"auto"`` (``"dV"`` if ``B_y`` is constant along every
+    leg to 1e-10, else ``"B"``). ``pullback(R, Z, j, sign)``: optional
+    exact map of points of plane ``j + sign`` to plane ``j`` (tests),
+    instead of tracing with ``rtol``. ``processes``: worker processes, one
+    plane pair at a time. Identical plane pairs (same meshes, legs and
+    pulled-back vertices to 1e-12 node spacings) are computed once.
+
+    Always-on self-checks (``AssertionError``): the pieces do not overlap
+    (area sums at most the source and destination cell areas, 1e-12
+    relative; equal where the tubes stay inside the mesh); every
+    reconstruction is exact for a random quadratic (linear) density; every
+    interior-leg column of ``dV D`` sums to zero (1e-12 relative); boundary
+    columns as above.
+
+    Returns ``(variables, stats)``.
+    """
+    import time
+
+    t_start = time.time()
+    if order not in (0, 1, 2):
+        raise ValueError("k2 order must be 0, 1 or 2")
+    ny = grid.ny
+    node_x = grid.node_x
+    cell_number = data["cell_number"]
+    total_cells = int(data["total_cells"])
+    dyj = grid.dy()
+    tracer = None
+    if pullback is None:
+        tracer = fieldtracer.FieldTracer(field)
+    cyl = is_cylindrical(field)
+
+    # Cell-space metric (boundary virtual cells: as their parent cell, as
+    # BOUT++'s parallel_neumann_o1)
+    dl_cell = np.zeros(total_cells)
+    dV_cell = np.zeros(total_cells)
+    dlf = (data["dy"] * np.sqrt(data["g_22"]))[:, :, 0]
+    dVf = (data["dy"] * data["dagp_us_volume"])[:, :, 0]
+    cn = cell_number[:, :, 0]
+    m = cn >= 0
+    dl_cell[cn[m]] = dlf[m]
+    dV_cell[cn[m]] = dVf[m]
+    for name in ("forward", "backward"):
+        b = data[f"{name}_cell_number"][:, :, 0]
+        mb = b >= 0
+        dl_cell[b[mb]] = dlf[mb]
+        dV_cell[b[mb]] = dVf[mb]
+
+    def bfield(R, Z, y):
+        By = field.Byfunc(R, Z, y)
+        return By, (By / field.Rfunc(R, Z, y) if cyl else By)
+
+    # Tube volumes per source node and direction
+    if tube_volume == "auto":
+        const = True
+        for name, sign in (("forward", 1), ("backward", -1)):
+            for j in range(ny):
+                pol = grid.plane(j)
+                b0, _ = bfield(pol.dof[:, 0], pol.dof[:, 1], grid.ycoords[j])
+                for R, Z, y in (
+                    (
+                        maps[f"{name}_half_R"][j],
+                        maps[f"{name}_half_Z"][j],
+                        grid.ycoords[j] + 0.5 * sign * dyj[j],
+                    ),
+                    (
+                        maps[f"{name}_R"][j],
+                        maps[f"{name}_Z"][j],
+                        grid.ycoords[j] + sign * dyj[j],
+                    ),
+                ):
+                    b1, _ = bfield(R, Z, y)
+                    if np.max(np.abs(b1 - b0) / np.abs(b0)) > 1e-10:
+                        const = False
+        tube_volume = "dV" if const else "B"
+    if tube_volume not in ("dV", "B"):
+        raise ValueError("tube_volume must be 'auto', 'dV' or 'B'")
+
+    # --- Pull back the destination dual triangles of every plane pair
+    items = []  # (j, sign)
+    for name, sign in (("forward", 1), ("backward", -1)):
+        for j in range(ny):
+            jd = j + sign
+            if not grid.yperiodic and (jd < 0 or jd >= ny):
+                continue
+            hit = maps[f"{name}_hit"][j]
+            interior = (hit == 0) & grid.interior
+            if not interior.any():
+                continue
+            items.append((name, sign, j, jd % ny, interior))
+    t_trace = time.time()
+    tri_cache = {}
+
+    def dest_triangles(pol, levels):
+        key = (id(pol), levels)
+        if key not in tri_cache:
+            td, od = _refine_triangles(*_dual_triangles(pol), levels)
+            verts, inv = _k2_vertices(pol, td)
+            tri_cache[key] = (td, od, verts, inv)
+        return tri_cache[key]
+
+    def pull(points, j, sign):
+        """Positions in plane j of points of plane j + sign."""
+        if pullback is not None:
+            R, Z = pullback(points[:, 0], points[:, 1], j, sign)
+            return np.column_stack([R, Z])
+        y0 = grid.ycoords[j] + sign * dyj[j]
+        traced = np.array(
+            tracer.follow_field_lines(
+                points[:, 0], points[:, 1], [y0, grid.ycoords[j]], rtol=rtol
+            )
+        )
+        return traced[-1]
+
+    levels_traced = 1 if refine == "auto" else int(refine)
+    pulled = []
+    max_dev = 0.0
+    for name, sign, j, jd, interior in items:
+        dst = grid.plane(jd)
+        td, od, verts, inv = dest_triangles(dst, levels_traced)
+        disp = pull(verts, j, sign) - verts
+        tdp = td + disp[inv].reshape(td.shape)
+        if refine == "auto":
+            # Affine test: traced midpoints of the first refinement against
+            # the midpoints of the traced vertices. In the refined list the
+            # parent triangle t has children t (a, ab, ca), N + t (ab, b,
+            # bc), 2N + t (ca, bc, c), 3N + t (ab, bc, ca)
+            N = len(td) // 4
+            a, b, c = tdp[:N, 0], tdp[N : 2 * N, 1], tdp[2 * N : 3 * N, 2]
+            mid = tdp[3 * N :]
+            lin = np.stack([0.5 * (a + b), 0.5 * (b + c), 0.5 * (c + a)], 1)
+            dev = np.max(np.abs(mid - lin) / dst.h)
+            max_dev = max(max_dev, float(dev))
+        pulled.append((tdp, od))
+    t_trace = time.time() - t_trace
+    if refine == "auto":
+        levels = 0 if max_dev < 1e-8 else 1
+        if levels == 0:
+            # Parent triangles: vertices a, b, c of the children
+            new = []
+            for tdp, od in pulled:
+                N = len(tdp) // 4
+                parent = np.stack(
+                    [tdp[:N, 0], tdp[N : 2 * N, 1], tdp[2 * N : 3 * N, 2]], 1
+                )
+                new.append((parent, od[:N]))
+            pulled = new
+    else:
+        levels = int(refine)
+
+    # --- Group identical plane pairs
+    unique = []  # indices into items of the computed pairs
+    which = []
+    for it, (name, sign, j, jd, interior) in enumerate(items):
+        found = -1
+        for u in unique:
+            _, s2, j2, jd2, int2 = items[u]
+            if (
+                s2 == sign
+                and grid.plane(j2) is grid.plane(j)
+                and grid.plane(jd2) is grid.plane(jd)
+                and np.array_equal(int2, interior)
+                and pulled[u][0].shape == pulled[it][0].shape
+                and np.max(np.abs(pulled[u][0] - pulled[it][0]))
+                <= 1e-12 * np.min(grid.plane(j).h)
+            ):
+                found = u
+                break
+        if found < 0:
+            unique.append(it)
+            found = it
+        which.append(found)
+
+    def task_of(it):
+        name, _, j, jd, interior = items[it]
+        return {
+            "src": grid.plane(j),
+            "dst": grid.plane(jd),
+            "td": pulled[it][0],
+            "od": pulled[it][1],
+            "interior": interior,
+            "order": order,
+            "max_cond": max_cond,
+            "seed": it,
+            "landing": np.column_stack((maps[f"{name}_R"][j], maps[f"{name}_Z"][j])),
+        }
+
+    results = {}
+    t_pairs = time.time()
+    if processes > 1 and len(unique) > 1:
+        import multiprocessing
+        from concurrent.futures import ProcessPoolExecutor
+
+        with ProcessPoolExecutor(
+            max_workers=processes, mp_context=multiprocessing.get_context("fork")
+        ) as ex:
+            futures = {}
+            queue = list(unique)
+            while queue or futures:
+                while queue and len(futures) < processes:
+                    u = queue.pop(0)
+                    futures[u] = ex.submit(_k2_pair_task, task_of(u))
+                u0 = next(iter(futures))
+                results[u0] = futures.pop(u0).result()
+    else:
+        for u in unique:
+            results[u] = _k2_pair_task(task_of(u))
+    t_pairs = time.time() - t_pairs
+
+    # --- Assemble in stored indices
+    out = {}
+    stats = {
+        "order": order,
+        "refine": levels,
+        "max_affine_deviation": max_dev,
+        "tube_volume": tube_volume,
+        "pairs": len(items),
+        "unique_pairs": len(unique),
+        "pieces": 0,
+        "order_counts": {},
+        "max_deficit_src": 0.0,
+        "max_deficit_dst": 0.0,
+        "n_deficit_src": 0,
+        "n_deficit_dst": 0,
+        "reconstruction_error": 0.0,
+    }
+    for u in unique:
+        st = results[u][2]
+        for key in ("pieces", "n_deficit_src", "n_deficit_dst"):
+            stats[key] += st[key]
+        for key in ("max_deficit_src", "max_deficit_dst", "reconstruction_error"):
+            stats[key] = max(stats[key], st[key])
+        for p, c in st["order_counts"].items():
+            stats["order_counts"][p] = stats["order_counts"].get(p, 0) + c
+    for name, sign in (("forward", 1), ("backward", -1)):
+        leg_int = data[f"{name}_leg_interior_number"][:, :, 0]
+        leg_bnd = data[f"{name}_leg_boundary_number"][:, :, 0]
+        bnd_cell = data[f"{name}_cell_number"][:, :, 0]
+        n_legs = int(data[f"n_{name}_legs"])
+        # Leg spacing as BOUT++: Interp_plus(dl)
+        F = (
+            data[f"{name}_weights"],
+            data[f"{name}_columns"],
+            data[f"{name}_rows"],
+        )
+        Fdl = (
+            np.add.reduceat(np.concatenate([F[0] * dl_cell[F[1]], [0.0]]), F[2][:-1])
+            if len(F[0])
+            else np.zeros(n_legs)
+        )
+        Fdl = np.where(np.diff(F[2]) > 0, Fdl, 0.0)
+        rows_all, cols_all, vals_all = [], [], []
+        for it, (nm, sg, j, jd, interior) in enumerate(items):
+            if nm != name:
+                continue
+            (Tr, Tc, Tv), (Orr, Oc, Ov), _ = results[which[it]]
+            src, dst = grid.plane(j), grid.plane(jd)
+            cells_j = cn[node_x, j]
+            cells_d = cn[node_x, jd]
+            legs_j = leg_int[node_x, j]
+            if np.any(legs_j[interior] < 0):
+                raise AssertionError("K2: leg numbering disagrees with the hits")
+            # Column scale V_tube / (dl A) per source node (interior legs)
+            A = src.dual_volumes()
+            dlp = 0.5 * (
+                dl_cell[cells_j] + np.where(interior, Fdl[np.maximum(legs_j, 0)], 0.0)
+            )
+            if tube_volume == "dV":
+                V = dV_cell[cells_j]
+            else:
+                y0 = grid.ycoords[j]
+                Bn, b0 = bfield(src.dof[:, 0], src.dof[:, 1], y0)
+                _, bh = bfield(
+                    maps[f"{name}_half_R"][j],
+                    maps[f"{name}_half_Z"][j],
+                    y0 + 0.5 * sign * dyj[j],
+                )
+                _, b1 = bfield(
+                    maps[f"{name}_R"][j], maps[f"{name}_Z"][j], y0 + sign * dyj[j]
+                )
+                V = A * Bn * dyj[j] * (1 / b0 + 4 / bh + 1 / b1) / 6.0
+            scale = V / (dlp * A)
+            # D = sign * dV^-1 (Own - T) scale
+            rows_all += [cells_j[Orr], cells_d[Tr]]
+            cols_all += [legs_j[Oc], legs_j[Tc]]
+            vals_all += [
+                sign * Ov * scale[Oc] / dV_cell[cells_j[Orr]],
+                -sign * Tv * scale[Tc] / dV_cell[cells_d[Tr]],
+            ]
+        # Boundary legs: the column of Div_minus / Div_plus
+        ev = grid.interior
+        for j in range(ny):
+            lb = leg_bnd[node_x, j]
+            sel = ev & (lb >= 0)
+            if not sel.any():
+                continue
+            c = cn[node_x[sel], j]
+            bc = bnd_cell[node_x[sel], j]
+            dlb = dl_cell[c]
+            rows_all += [c, bc]
+            cols_all += [lb[sel], lb[sel]]
+            vals_all += [sign / dlb, -sign / dlb]
+        r = np.concatenate(rows_all) if rows_all else np.zeros(0, int)
+        c = np.concatenate(cols_all) if cols_all else np.zeros(0, int)
+        v = np.concatenate(vals_all) if vals_all else np.zeros(0)
+        if np.any(r < 0) or np.any(c < 0) or np.any(c >= n_legs):
+            raise AssertionError(f"K2 {name}: invalid row or column index")
+        ptr, cols, vals = _csr(total_cells, r, c, v)
+        # Self-check: column conservation sum_rows dV D = 0 for every leg
+        rows = np.repeat(np.arange(total_cells), np.diff(ptr))
+        colsum = np.bincount(cols, weights=dV_cell[rows] * vals, minlength=n_legs)
+        # (scale from the entries before duplicates were merged: own-face
+        # and deposit entries in the same cell cancel when a plane maps
+        # onto itself)
+        colabs = np.bincount(c, weights=np.abs(dV_cell[r] * v), minlength=n_legs)
+        bad = np.abs(colsum) > 1e-12 * np.maximum(colabs, 1e-300)
+        if np.any(bad):
+            raise AssertionError(
+                f"K2 {name}: {int(bad.sum())} columns not conservative "
+                f"(max relative {np.max(np.abs(colsum) / np.maximum(colabs, 1e-300)):.2e})"
+            )
+        stats[f"max_column_sum_{name}"] = float(
+            np.max(np.abs(colsum) / np.maximum(colabs, 1e-300), initial=0.0)
+        )
+        out[f"k2_{name}_rows"] = ptr
+        out[f"k2_{name}_columns"] = cols
+        out[f"k2_{name}_weights"] = vals
+        stats[f"nnz_{name}"] = len(vals)
+    out["k2_order"] = int(order)
+    out["k2_version"] = K2_VERSION
+    stats["time_trace"] = t_trace
+    stats["time_pairs"] = t_pairs
+    stats["time"] = time.time() - t_start
+    return out, stats
+
+
+# ----------------------------------------------------------------------
 # Top level
 
 
@@ -1981,6 +2832,10 @@ def build_grid_data(
     dagp_extra=16,
     value_order=2,
     processes=1,
+    k2=True,
+    k2_order=2,
+    k2_refine="auto",
+    k2_tube_volume="auto",
 ):
     """Compute every variable of the grid-file contract. Returns
     ``(data, stats)``.
@@ -2004,6 +2859,11 @@ def build_grid_data(
     ``processes`` is the number of worker processes for the perpendicular
     operator of the planes (see :func:`dagp_unstructured`; each worker holds
     one plane, about 0.3 GB for a 7000-node gmsh plane).
+    ``k2`` (default True) also computes the flux-reconstructed conservative
+    parallel half-divergences ``k2_*`` (see :func:`k2_divergence`) with
+    reconstruction order ``k2_order`` (2 = quadF, 1 = lin), ``k2_refine``
+    and ``k2_tube_volume``; ``k2=False`` skips them (faster, for tests that
+    do not need them).
     """
     maps = trace_maps(grid, field, rtol=rtol, domain_tol=domain_tol)
     som, som_stats = som_weights(
@@ -2051,6 +2911,20 @@ def build_grid_data(
         legs = data[f"{name}_leg_interior_number"][grid.node_x[evolving], :, 0].T
         if not np.array_equal(legs >= 0, hit[:, evolving] == 0):
             raise AssertionError(f"{name}: leg classification disagrees with xt_prime")
+    k2_stats = None
+    if k2:
+        k2_data, k2_stats = k2_divergence(
+            grid,
+            field,
+            maps,
+            data,
+            order=k2_order,
+            refine=k2_refine,
+            tube_volume=k2_tube_volume,
+            rtol=rtol,
+            processes=processes,
+        )
+        data.update(k2_data)
     data["unstructured"] = 1
     data["MXG"] = grid.MXG
     data["MYG"] = grid.MYG
@@ -2060,6 +2934,7 @@ def build_grid_data(
         "ny": grid.ny,
         "som": som_stats,
         "dagp": dagp_stats,
+        "k2": k2_stats,
         "forward_hits": int(np.sum(maps["forward_hit"] != 0)),
         "backward_hits": int(np.sum(maps["backward_hit"] != 0)),
     }
@@ -2250,7 +3125,18 @@ def make_test_grid(family, n, filename=None, **kwargs):
     ``"bout_mms_cyl_sheared"`` (cylindrical, sheared field, ``n`` planes; for
     the parallel operators). Other families are built by the callers with
     :func:`make_unstructured_grid`.
+
+    Keyword arguments that are options of :func:`build_grid_data` (e.g.
+    ``k2=False``, ``processes``) are passed to it; the others override the
+    family parameters (``seed``, ``jitter``, ...).
     """
+    import inspect
+
+    build_keys = set(inspect.signature(build_grid_data).parameters) - {
+        "grid",
+        "field",
+    }
+    build = {k: kwargs.pop(k) for k in list(kwargs) if k in build_keys}
     if family == "bout_mms_cyl_sheared":
         p = dict(BOUT_MMS_CYL_SHEARED, **kwargs)
         pol = UnstructuredPoloidalGrid.slab(
@@ -2276,6 +3162,7 @@ def make_test_grid(family, n, filename=None, **kwargs):
             Ly=2.0 * np.pi,
             yperiodic=True,
             dirichlet_walls=p["dirichlet_walls"],
+            **build,
         )
     if family == "bout_mms_cyl":
         from .field import Screwpinch
@@ -2304,6 +3191,7 @@ def make_test_grid(family, n, filename=None, **kwargs):
             Ly=2.0 * np.pi,
             yperiodic=True,
             dirichlet_walls=True,
+            **build,
         )
     if family == "bout_mms_iso":
         p = dict(BOUT_MMS_ISO, **kwargs)
@@ -2323,7 +3211,7 @@ def make_test_grid(family, n, filename=None, **kwargs):
         )
         field = Slab(Bz=0.05, Bzprime=0.1)
         return make_unstructured_grid(
-            filename, pol, field, ny=n, Ly=p["Ly"], yperiodic=True
+            filename, pol, field, ny=n, Ly=p["Ly"], yperiodic=True, **build
         )
     if family != "bout_mms":
         raise ValueError(f"Unknown test-grid family '{family}'")
@@ -2343,7 +3231,7 @@ def make_test_grid(family, n, filename=None, **kwargs):
     )
     field = Slab(Bz=0.05, Bzprime=0.1)
     return make_unstructured_grid(
-        filename, pol, field, ny=n, Ly=p["Ly"], yperiodic=True
+        filename, pol, field, ny=n, Ly=p["Ly"], yperiodic=True, **build
     )
 
 
@@ -2360,6 +3248,7 @@ __all__ = [
     "dagp_unstructured",
     "gmsh_planes",
     "is_cylindrical",
+    "k2_divergence",
     "make_test_grid",
     "make_unstructured_grid",
     "num_coefs",

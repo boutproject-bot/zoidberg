@@ -942,3 +942,209 @@ def test_parallel_planes_identical():
     assert results[0].keys() == results[1].keys()
     for key in results[0]:
         assert np.array_equal(np.asarray(results[0][key]), np.asarray(results[1][key]))
+
+
+# ----------------------------------------------------------------------
+# K2: flux-reconstructed conservative parallel half-divergences
+
+
+def _csr_from(data, name, shape):
+    from scipy.sparse import csr_matrix
+
+    return csr_matrix(
+        (data[f"{name}_weights"], data[f"{name}_columns"], data[f"{name}_rows"]),
+        shape=shape,
+    )
+
+
+def _support_half_divergences(data):
+    """Div_minus and Div_plus of BOUT++'s PetscOperators::getParallel,
+    rebuilt from the grid variables (unit leg weights)."""
+    from scipy.sparse import csr_matrix, diags
+
+    nc = int(data["total_cells"])
+    cn = data["cell_number"][..., 0]
+    dl_f = (data["dy"] * np.sqrt(data["g_22"]))[..., 0]
+    dV_f = (data["dy"] * data["dagp_us_volume"])[..., 0]
+    dl, dV = np.zeros(nc), np.zeros(nc)
+    for numbers in (cn, data["forward_cell_number"][..., 0]):
+        m = numbers >= 0
+        dl[numbers[m]], dV[numbers[m]] = dl_f[m], dV_f[m]
+    m = data["backward_cell_number"][..., 0] >= 0
+    dl[data["backward_cell_number"][..., 0][m]] = dl_f[m]
+    dV[data["backward_cell_number"][..., 0][m]] = dV_f[m]
+    out = {}
+    for name, sign in (("forward", 1), ("backward", -1)):
+        nl = int(data[f"n_{name}_legs"])
+        F = _csr_from(data, name, (nl, nc))
+        rows, cols = [], []
+        for kind in ("interior", "boundary"):
+            legs = data[f"{name}_leg_{kind}_number"][..., 0]
+            m = (legs >= 0) & (cn >= 0)
+            rows.append(legs[m])
+            cols.append(cn[m])
+        inj = csr_matrix(
+            (np.ones(nl), (np.concatenate(rows), np.concatenate(cols))), shape=(nl, nc)
+        )
+        interp = 0.5 * (F + inj)
+        grad = diags(sign / (interp @ dl)) @ (F - inj)
+        out[name] = (diags(-1 / dV) @ grad.T @ diags(interp @ dV)).tocsr()
+    return out, dV
+
+
+def test_k2_overlap_partition_and_moments():
+    # The pieces of the dual cells with the pulled-back destination cells
+    # (another mesh, sheared) tile both planes exactly, and the polygon
+    # moments integrate quadratics exactly
+    def plane(n, seed):
+        return us.UnstructuredPoloidalGrid.slab(
+            n,
+            n + 2,
+            1.0,
+            1.0,
+            jitter=0.2,
+            jitter_dirs="rz",
+            seed=seed,
+            periodic_R=False,
+            periodic_Z=True,
+            r_on_walls=True,
+        )
+
+    src, dst = plane(10, 3), plane(11, 4)
+    td, od = us._dual_triangles(dst)
+    td = td.copy()
+    td[..., 1] -= 0.13 + 0.3 * td[..., 0]  # affine, area-preserving shear
+    o, k, mom, contains, pulled = us._k2_pieces(src, td, od)
+    A_src = us._k2_cell_moments(src)[:, 0]
+    assert np.allclose(np.bincount(o, mom[:, 0]), A_src, rtol=1e-12, atol=0)
+    assert np.allclose(np.bincount(k, mom[:, 0]), dst.dual_volumes(), rtol=1e-12)
+    assert np.allclose(pulled, dst.dual_volumes(), rtol=1e-12)
+    # Every source dof lies in (at least) one of its pieces
+    assert np.all(np.bincount(o, contains) >= 1)
+    # Moments against a 3-point (degree-2 exact) rule on random triangles
+    rng = np.random.default_rng(0)
+    T = rng.standard_normal((50, 3, 2))
+    T[us._tri_area_signed(T) < 0] = T[us._tri_area_signed(T) < 0][:, ::-1]
+    P = np.concatenate([T, np.repeat(T[:, :1], 6, axis=1)], axis=1)
+    m = us._poly_moments(P)
+    A = us._tri_area_signed(T)
+    q = 0.5 * (T + np.roll(T, -1, axis=1))  # edge midpoints
+    x, y = q[..., 0], q[..., 1]
+    for col, f in enumerate((x**0, x, y, x * x, x * y, y * y)):
+        assert np.allclose(m[:, col], A * f.mean(axis=1), rtol=1e-12, atol=1e-14)
+
+
+def test_k2_reconstruction_exact():
+    # quadF (lin) reconstructions reproduce quadratic (linear) densities;
+    # cells without an interior leg are excluded from every stencil
+    pol = strip(nR=8, nZ=24)
+    cand = np.ones(pol.n_nodes, dtype=bool)
+    cand[pol.R < pol.R.min() + 1e-9] = False
+    for order in (1, 2):
+        nb, P, used = us._k2_reconstruction(pol, cand, order)
+        assert np.all(used[cand] == order) and np.all(used[~cand] == -1)
+        assert np.all(cand[nb[cand]])
+        assert us._k2_check_reconstruction(pol, nb, P, used) < 1e-12
+
+
+def test_k2_order0_equals_support_operator():
+    # Convention check: with a straight field (injection maps, identity
+    # pull-back) the constant reconstruction gives exactly BOUT++'s
+    # Div_minus / Div_plus, including the boundary legs of a y-bounded grid
+    pol = strip(nR=8, nZ=8)
+    field = zbfield.Slab(By=1.0, Bz=0.0, Bzprime=0.0)
+    _, data, stats = us.make_unstructured_grid(
+        None, pol, field, ny=4, Ly=10.0, yperiodic=False, k2_order=0
+    )
+    assert stats["k2"]["order"] == 0
+    so, _ = _support_half_divergences(data)
+    nc = int(data["total_cells"])
+    for name in ("forward", "backward"):
+        nl = int(data[f"n_{name}_legs"])
+        assert np.any(data[f"{name}_leg_boundary_number"] >= 0)
+        D = _csr_from(data, f"k2_{name}", (nc, nl))
+        diff = abs(D - so[name]).max()
+        assert diff <= 1e-13 * abs(so[name]).max(), name
+
+
+def test_k2_reproduces_prototype():
+    # quadF matrices of the validated prototype k2fast.py (P-025 route B,
+    # exact analytic maps), fingerprinted as D v for a fixed random vector
+    # (zoidberg/test_data/k2_prototype_reference.npz); zoidberg traces the
+    # field lines, which agree with the analytic maps to round-off here
+    ref = np.load(Path(__file__).parent / "test_data" / "k2_prototype_reference.npz")
+    for family in ("bout_mms", "bout_mms_cyl_sheared"):
+        _, data, stats = us.make_test_grid(family, 16, k2_refine=0)
+        assert stats["k2"]["tube_volume"] == "dV"
+        nc = int(data["total_cells"])
+        cn = data["cell_number"][..., 0]
+        v = np.random.default_rng(0).standard_normal(nc)
+        for name in ("forward", "backward"):
+            nl = int(data[f"n_{name}_legs"])
+            legs = data[f"{name}_leg_interior_number"][..., 0]
+            assert np.all((legs >= 0) == (cn >= 0))
+            v_leg = np.zeros(nl)
+            v_leg[legs[legs >= 0]] = v[cn[legs >= 0]]
+            Dv = _csr_from(data, f"k2_{name}", (nc, nl)) @ v_leg
+            r = ref[f"{family}_{name}"]
+            assert np.max(np.abs(Dv - r)) <= 1e-12 * np.max(np.abs(r)), family
+
+
+def test_k2_gmsh_walls():
+    # Independently meshed gmsh planes with curved Dirichlet walls and a
+    # sheared field whose lines cross the walls (boundary legs, tubes that
+    # partly leave the mesh, curved images): every column of dV D sums to
+    # zero, boundary-leg columns are those of Div_minus / Div_plus, and a
+    # leg flux that is constant along the field is nearly divergence-free
+    pytest.importorskip("gmsh")
+    shapes = [_curved_annulus(shift) for shift in (0.0, 0.03, -0.02)]
+    planes = us.gmsh_planes(
+        [o for o, _ in shapes], [i for _, i in shapes], mesh_size=1 / 12
+    )
+    field = us.ShearedCylinderField(0.2, 0.3, 2.0)
+    _, data, stats = us.make_unstructured_grid(
+        None, planes, field, ny=3, Ly=0.6, dirichlet_walls=True
+    )
+    st = stats["k2"]
+    assert st["refine"] == 1 and st["unique_pairs"] == 6
+    assert st["n_deficit_src"] > 0 and st["n_deficit_dst"] > 0
+    assert st["order_counts"].get(2, 0) > 0.9 * sum(st["order_counts"].values())
+    so, dV = _support_half_divergences(data)
+    nc = int(data["total_cells"])
+    for name in ("forward", "backward"):
+        nl = int(data[f"n_{name}_legs"])
+        D = _csr_from(data, f"k2_{name}", (nc, nl))
+        colsum = dV @ D
+        assert np.max(np.abs(colsum)) <= 1e-12 * np.max(abs(D).T @ dV)
+        bnd = data[f"{name}_leg_boundary_number"][..., 0]
+        bnd = bnd[bnd >= 0]
+        assert len(bnd) > 10
+        assert abs(D[:, bnd] - so[name][:, bnd]).max() <= 1e-14 * abs(D).max()
+        # Rows only for cells (evolving, Dirichlet wall, boundary virtual)
+        assert D.shape[0] == nc
+
+
+def test_k2_variables_in_grid_file(tmp_path):
+    pol = strip(nR=8, nZ=8)
+    field = zbfield.Slab(Bz=0.05, Bzprime=0.1)
+    us.make_unstructured_grid(str(tmp_path / "g.nc"), pol, field, ny=4, Ly=10.0)
+    us.make_unstructured_grid(
+        str(tmp_path / "n.nc"), pol, field, ny=4, Ly=10.0, k2=False
+    )
+    from boututils.datafile import DataFile
+
+    with DataFile(str(tmp_path / "g.nc")) as f:
+        assert int(f["k2_order"]) == 2
+        assert int(f["k2_version"]) == us.K2_VERSION
+        nc, nl = int(f["total_cells"]), int(f["n_forward_legs"])
+        for name in ("forward", "backward"):
+            rows = f[f"k2_{name}_rows"]
+            cols = f[f"k2_{name}_columns"]
+            assert len(rows) == nc + 1 and rows[-1] == len(cols)
+            assert len(f[f"k2_{name}_weights"]) == len(cols)
+            assert cols.min() >= 0 and cols.max() < nl
+            for r in range(nc):
+                c = cols[rows[r] : rows[r + 1]]
+                assert len(np.unique(c)) == len(c)
+    with DataFile(str(tmp_path / "n.nc")) as f:
+        assert not any(k.startswith("k2_") for k in f.list())
