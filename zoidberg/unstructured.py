@@ -3160,7 +3160,14 @@ def family_spec(family, n, **kwargs):
     :func:`make_test_grid`). Returns ``(poloidal, field, layout)`` with
     ``layout`` the keyword arguments ``ny``, ``Ly``, ``yperiodic`` and
     ``dirichlet_walls`` of :func:`make_unstructured_grid`. ``kwargs``
-    override the family parameters."""
+    override the family parameters. The planes have centroidally relaxed
+    nodes as unknowns (:meth:`UnstructuredPoloidalGrid.slab`, ``relax=True``;
+    on the walls of ``bout_mms_iso`` and the cylinder families the wall
+    nodes stay on the wall, half a cell from their dual-cell centroid);
+    ``centroid_dofs=True`` puts the unknowns at the dual-cell centroids
+    instead (:meth:`UnstructuredPoloidalGrid.use_centroid_dofs`), which the
+    K2 divergence needs for second order next to walls."""
+    centroid_dofs = kwargs.pop("centroid_dofs", False)
     if family == "bout_mms_cyl_sheared":
         p = dict(BOUT_MMS_CYL_SHEARED, **kwargs)
         pol = UnstructuredPoloidalGrid.slab(
@@ -3246,6 +3253,8 @@ def family_spec(family, n, **kwargs):
         layout = {"ny": n, "Ly": p["Ly"], "yperiodic": True, "dirichlet_walls": False}
     else:
         raise ValueError(f"Unknown test-grid family '{family}'")
+    if centroid_dofs:
+        pol.use_centroid_dofs()
     return pol, field, layout
 
 
