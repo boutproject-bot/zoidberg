@@ -3115,6 +3115,100 @@ class ShearedCylinderField(MagneticField):
         return np.asarray(x, dtype=float)
 
 
+def family_spec(family, n, **kwargs):
+    """Poloidal mesh, field and layout of a test-grid family (see
+    :func:`make_test_grid`). Returns ``(poloidal, field, layout)`` with
+    ``layout`` the keyword arguments ``ny``, ``Ly``, ``yperiodic`` and
+    ``dirichlet_walls`` of :func:`make_unstructured_grid`. ``kwargs``
+    override the family parameters."""
+    if family == "bout_mms_cyl_sheared":
+        p = dict(BOUT_MMS_CYL_SHEARED, **kwargs)
+        pol = UnstructuredPoloidalGrid.slab(
+            n + 1,
+            n,
+            p["Lx"],
+            p["Lz"],
+            R0=p["R0"],
+            Z0=0.0,
+            jitter=p["jitter"],
+            jitter_dirs="rz",
+            periodic_R=False,
+            periodic_Z=True,
+            seed=p["seed"] + n,
+            r_on_walls=True,
+        )
+        field = ShearedCylinderField(p["Bz0"], p["Bzprime"], p["Rc"])
+        layout = {
+            "ny": p["ny"] or n,
+            "Ly": 2.0 * np.pi,
+            "yperiodic": True,
+            "dirichlet_walls": p["dirichlet_walls"],
+        }
+    elif family == "bout_mms_cyl":
+        from .field import Screwpinch
+
+        p = dict(BOUT_MMS_CYL, **kwargs)
+        pol = UnstructuredPoloidalGrid.slab(
+            n + 1,
+            n,
+            p["Lx"],
+            p["Lz"],
+            R0=p["R0"],
+            Z0=0.0,
+            jitter=p["jitter"],
+            jitter_dirs="rz",
+            periodic_R=False,
+            periodic_Z=True,
+            seed=p["seed"] + n,
+            r_on_walls=True,
+        )
+        field = Screwpinch(xcentre=p["R0"] + 0.5 * p["Lx"], shear=0.0, Btor=1.0)
+        layout = {
+            "ny": p["ny"],
+            "Ly": 2.0 * np.pi,
+            "yperiodic": True,
+            "dirichlet_walls": True,
+        }
+    elif family == "bout_mms_iso":
+        p = dict(BOUT_MMS_ISO, **kwargs)
+        pol = UnstructuredPoloidalGrid.slab(
+            max(p["nR_min"], n // p["nR_divisor"]),
+            n,
+            p["Lx"],
+            p["Lz"],
+            R0=p["R0"],
+            Z0=p["Z0"],
+            jitter=p["jitter"],
+            jitter_dirs="rz",
+            periodic_R=False,
+            periodic_Z=True,
+            seed=p["seed"] + n,
+            r_on_walls=True,
+        )
+        field = Slab(Bz=0.05, Bzprime=0.1)
+        layout = {"ny": n, "Ly": p["Ly"], "yperiodic": True, "dirichlet_walls": False}
+    elif family == "bout_mms":
+        p = dict(BOUT_MMS, **kwargs)
+        pol = UnstructuredPoloidalGrid.slab(
+            p["nR"],
+            n,
+            p["Lx"],
+            p["Lz"],
+            R0=p["R0"],
+            Z0=p["Z0"],
+            jitter=p["jitter"],
+            jitter_dirs="z",
+            periodic_R=False,
+            periodic_Z=True,
+            seed=p["seed"] + n,
+        )
+        field = Slab(Bz=0.05, Bzprime=0.1)
+        layout = {"ny": n, "Ly": p["Ly"], "yperiodic": True, "dirichlet_walls": False}
+    else:
+        raise ValueError(f"Unknown test-grid family '{family}'")
+    return pol, field, layout
+
+
 def make_test_grid(family, n, filename=None, **kwargs):
     """Shared entry point for test grids (used by BOUT-dev and Hermes-3).
 
@@ -3137,102 +3231,124 @@ def make_test_grid(family, n, filename=None, **kwargs):
         "field",
     }
     build = {k: kwargs.pop(k) for k in list(kwargs) if k in build_keys}
-    if family == "bout_mms_cyl_sheared":
-        p = dict(BOUT_MMS_CYL_SHEARED, **kwargs)
-        pol = UnstructuredPoloidalGrid.slab(
-            n + 1,
-            n,
-            p["Lx"],
-            p["Lz"],
-            R0=p["R0"],
-            Z0=0.0,
-            jitter=p["jitter"],
-            jitter_dirs="rz",
-            periodic_R=False,
-            periodic_Z=True,
-            seed=p["seed"] + n,
-            r_on_walls=True,
-        )
-        field = ShearedCylinderField(p["Bz0"], p["Bzprime"], p["Rc"])
-        return make_unstructured_grid(
-            filename,
-            pol,
-            field,
-            ny=p["ny"] or n,
-            Ly=2.0 * np.pi,
-            yperiodic=True,
-            dirichlet_walls=p["dirichlet_walls"],
-            **build,
-        )
-    if family == "bout_mms_cyl":
-        from .field import Screwpinch
+    pol, field, layout = family_spec(family, n, **kwargs)
+    return make_unstructured_grid(filename, pol, field, **layout, **build)
 
-        p = dict(BOUT_MMS_CYL, **kwargs)
-        pol = UnstructuredPoloidalGrid.slab(
-            n + 1,
-            n,
-            p["Lx"],
-            p["Lz"],
-            R0=p["R0"],
-            Z0=0.0,
-            jitter=p["jitter"],
-            jitter_dirs="rz",
-            periodic_R=False,
-            periodic_Z=True,
-            seed=p["seed"] + n,
-            r_on_walls=True,
-        )
-        field = Screwpinch(xcentre=p["R0"] + 0.5 * p["Lx"], shear=0.0, Btor=1.0)
-        return make_unstructured_grid(
-            filename,
-            pol,
-            field,
-            ny=p["ny"],
-            Ly=2.0 * np.pi,
-            yperiodic=True,
-            dirichlet_walls=True,
-            **build,
-        )
-    if family == "bout_mms_iso":
-        p = dict(BOUT_MMS_ISO, **kwargs)
-        pol = UnstructuredPoloidalGrid.slab(
-            max(p["nR_min"], n // p["nR_divisor"]),
-            n,
-            p["Lx"],
-            p["Lz"],
-            R0=p["R0"],
-            Z0=p["Z0"],
-            jitter=p["jitter"],
-            jitter_dirs="rz",
-            periodic_R=False,
-            periodic_Z=True,
-            seed=p["seed"] + n,
-            r_on_walls=True,
-        )
-        field = Slab(Bz=0.05, Bzprime=0.1)
-        return make_unstructured_grid(
-            filename, pol, field, ny=n, Ly=p["Ly"], yperiodic=True, **build
-        )
-    if family != "bout_mms":
-        raise ValueError(f"Unknown test-grid family '{family}'")
-    p = dict(BOUT_MMS, **kwargs)
-    pol = UnstructuredPoloidalGrid.slab(
-        p["nR"],
-        n,
-        p["Lx"],
-        p["Lz"],
-        R0=p["R0"],
-        Z0=p["Z0"],
-        jitter=p["jitter"],
-        jitter_dirs="z",
-        periodic_R=False,
-        periodic_Z=True,
-        seed=p["seed"] + n,
+
+def family_grid(family, n, **kwargs):
+    """The :class:`UnstructuredGrid` and field of a test-grid family, without
+    computing the grid data (e.g. for :func:`add_k2_to_file`)."""
+    pol, field, layout = family_spec(family, n, **kwargs)
+    ny = layout.pop("ny")
+    grid = UnstructuredGrid(
+        pol,
+        np.linspace(0.0, layout["Ly"], ny, endpoint=False),
+        layout["Ly"],
+        yperiodic=layout["yperiodic"],
+        dirichlet_walls=layout["dirichlet_walls"],
     )
-    field = Slab(Bz=0.05, Bzprime=0.1)
-    return make_unstructured_grid(
-        filename, pol, field, ny=n, Ly=p["Ly"], yperiodic=True, **build
-    )
+    return grid, field
+
+
+def add_k2_to_file(filename, grid, field, rtol=1e-10, domain_tol=1e-9, **k2_options):
+    """Add (or overwrite) the ``k2_*`` variables of an existing unstructured
+    grid file, without regenerating its other variables.
+
+    The file stores neither the triangulations nor the field, so ``grid``
+    (:class:`UnstructuredGrid`) and ``field`` must be the ones the file was
+    made with (e.g. from :func:`family_grid`). They are checked against
+    the file: the unknowns' positions, the traced end points and the leg
+    classification must agree to 1e-10 (relative to the node spacing).
+    The numbering, the leg stencils, ``dy``, ``g_22`` and ``dagp_us_volume``
+    are read from the file, so the matrices match its other variables.
+    ``rtol`` and ``domain_tol`` as for :func:`build_grid_data`; further
+    options go to :func:`k2_divergence`. Returns the statistics.
+    """
+    import os
+
+    import netCDF4
+
+    names = [
+        "cell_number",
+        "total_cells",
+        "forward_cell_number",
+        "backward_cell_number",
+        "dy",
+        "g_22",
+        "dagp_us_volume",
+        "R",
+        "Z",
+    ]
+    for d in ("forward", "backward"):
+        names += [
+            f"{d}_leg_interior_number",
+            f"{d}_leg_boundary_number",
+            f"n_{d}_legs",
+            f"{d}_rows",
+            f"{d}_columns",
+            f"{d}_weights",
+            f"{d}_R",
+            f"{d}_Z",
+            f"{d}_xt_prime",
+        ]
+    with netCDF4.Dataset(filename) as f:
+        if int(np.asarray(f["unstructured"][...])) != 1:
+            raise ValueError(f"{filename} is not an unstructured grid file")
+        data = {}
+        for k in names:
+            v = np.asarray(f[k][...])
+            data[k] = v if v.ndim else v.item()
+        existing = [k for k in f.variables if k.startswith("k2_")]
+    if tuple(data["cell_number"].shape) != grid.shape:
+        raise ValueError(
+            f"Grid shape {grid.shape} does not match the file {data['cell_number'].shape}"
+        )
+    h = min(np.min(grid.plane(j).h) for j in range(grid.ny))
+    dof = np.array([grid.plane(j).dof for j in range(grid.ny)])
+    for c, key in enumerate(("R", "Z")):
+        if np.max(np.abs(grid.to3d(dof[..., c]) - data[key])) > 1e-10 * h:
+            raise ValueError(f"{key} of the grid does not match the file")
+    maps = trace_maps(grid, field, rtol=rtol, domain_tol=domain_tol)
+    ev = grid.interior
+    for d in ("forward", "backward"):
+        for c in ("R", "Z"):
+            diff = grid.to3d(maps[f"{d}_{c}"]) - data[f"{d}_{c}"]
+            if np.max(np.abs(diff[grid.node_x[ev]])) > 1e-10 * max(h, 1.0):
+                raise ValueError(f"{d}_{c}: traced end points differ from the file")
+        legs = data[f"{d}_leg_interior_number"][grid.node_x[ev], :, 0].T
+        if not np.array_equal(legs >= 0, maps[f"{d}_hit"][:, ev] == 0):
+            raise ValueError(f"{d}: leg classification differs from the file")
+    k2_data, stats = k2_divergence(grid, field, maps, data, rtol=rtol, **k2_options)
+    if existing:
+        # netCDF cannot resize dimensions: copy the file without the old
+        # k2 variables
+        tmp = str(filename) + ".k2tmp"
+        with (
+            netCDF4.Dataset(filename) as src,
+            netCDF4.Dataset(tmp, "w", format=src.data_model) as dst,
+        ):
+            dst.setncatts({a: src.getncattr(a) for a in src.ncattrs()})
+            used = {
+                d
+                for k, v in src.variables.items()
+                if k not in existing
+                for d in v.dimensions
+            }
+            for name, dim in src.dimensions.items():
+                if name in used:
+                    dst.createDimension(name, None if dim.isunlimited() else len(dim))
+            for name, var in src.variables.items():
+                if name in existing:
+                    continue
+                out = dst.createVariable(name, var.datatype, var.dimensions)
+                out.setncatts({a: var.getncattr(a) for a in var.ncattrs()})
+                out[...] = var[...]
+        os.replace(tmp, filename)
+    from .zoidberg import MapWriter
+
+    with MapWriter(str(filename), quiet=True, create=False) as mw:
+        mw.write_dict(k2_data)
+    return stats
 
 
 __all__ = [
@@ -3244,8 +3360,11 @@ __all__ = [
     "StencilFallbackWarning",
     "UnstructuredGrid",
     "UnstructuredPoloidalGrid",
+    "add_k2_to_file",
     "build_grid_data",
     "dagp_unstructured",
+    "family_grid",
+    "family_spec",
     "gmsh_planes",
     "is_cylindrical",
     "k2_divergence",

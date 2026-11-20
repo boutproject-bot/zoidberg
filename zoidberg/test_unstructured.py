@@ -1148,3 +1148,26 @@ def test_k2_variables_in_grid_file(tmp_path):
                 assert len(np.unique(c)) == len(c)
     with DataFile(str(tmp_path / "n.nc")) as f:
         assert not any(k.startswith("k2_") for k in f.list())
+
+
+def test_add_k2_to_file(tmp_path):
+    # Existing grid files (without K2, or with another order) get the same
+    # k2 variables as a fresh build; a grid that does not match is refused
+    from boututils.datafile import DataFile
+
+    path = str(tmp_path / "g.nc")
+    _, data0, _ = us.make_test_grid("bout_mms", 8, filename=path, k2=False)
+    grid, field = us.family_grid("bout_mms", 8)
+    for order in (1, 2):
+        us.add_k2_to_file(path, grid, field, order=order)
+        _, ref, _ = us.make_test_grid("bout_mms", 8, k2_order=order)
+        with DataFile(path) as f:
+            assert int(f["k2_order"]) == order
+            for d in ("forward", "backward"):
+                for part in ("rows", "columns", "weights"):
+                    key = f"k2_{d}_{part}"
+                    assert np.array_equal(f[key], ref[key]), key
+            assert np.array_equal(f["forward_weights"], data0["forward_weights"])
+    other, field = us.family_grid("bout_mms", 8, seed=99)
+    with pytest.raises(ValueError):
+        us.add_k2_to_file(path, other, field)
