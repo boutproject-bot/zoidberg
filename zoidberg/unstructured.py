@@ -319,6 +319,7 @@ class UnstructuredPoloidalGrid:
         if walls is not None:
             self.walls = tuple(np.asarray(w, dtype=int).ravel() for w in walls)
         self._faces = None
+        self._topology = None
         self._kdtree = None
 
     # ------------------------------------------------------------------
@@ -623,23 +624,12 @@ class UnstructuredPoloidalGrid:
     # ------------------------------------------------------------------
     # Dual mesh
 
-    def faces(self):
-        """Dual faces of the centroid-dual mesh.
-
-        Returns a dict with arrays (one entry per primal edge ``i < j``):
-
-        - ``i``, ``j``: node indices
-        - ``start``, ``end``: face end points, relative to node ``i``
-          (unwrapped), oriented so that the normal ``(dZ, -dR)`` of
-          ``end - start`` points from ``i`` to ``j``
-        - ``boundary``: True if the edge lies on a domain wall
-        """
-        if self._faces is not None:
-            return self._faces
-        pts = self.points
-        tri_pts = self._unwrapped_triangles()
-        centroids = tri_pts.mean(axis=1)  # unwrapped near vertex 0
-
+    def _edge_topology(self):
+        """Primal edges ``i < j`` with their first and second triangle. They
+        depend only on the connectivity, so they are kept when the nodes move
+        (e.g. in :meth:`centroidal_relax`)."""
+        if self._topology is not None:
+            return self._topology
         t = self.triangles
         pairs = np.concatenate([t[:, [0, 1]], t[:, [1, 2]], t[:, [2, 0]]])
         tri_of = np.tile(np.arange(len(t)), 3)
@@ -657,7 +647,27 @@ class UnstructuredPoloidalGrid:
         first = tri_of[order[starts]]
         has2 = counts == 2
         second[has2] = tri_of[order[starts[has2] + 1]]
+        self._topology = (edges, first, second, has2)
+        return self._topology
 
+    def faces(self):
+        """Dual faces of the centroid-dual mesh.
+
+        Returns a dict with arrays (one entry per primal edge ``i < j``):
+
+        - ``i``, ``j``: node indices
+        - ``start``, ``end``: face end points, relative to node ``i``
+          (unwrapped), oriented so that the normal ``(dZ, -dR)`` of
+          ``end - start`` points from ``i`` to ``j``
+        - ``boundary``: True if the edge lies on a domain wall
+        """
+        if self._faces is not None:
+            return self._faces
+        pts = self.points
+        tri_pts = self._unwrapped_triangles()
+        centroids = tri_pts.mean(axis=1)  # unwrapped near vertex 0
+
+        edges, first, second, has2 = self._edge_topology()
         I, J = edges[:, 0], edges[:, 1]
         xi = pts[I]
         xj_rel = self.minimum_image(pts[J] - xi)
