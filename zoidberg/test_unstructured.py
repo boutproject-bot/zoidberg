@@ -1171,3 +1171,28 @@ def test_add_k2_to_file(tmp_path):
     other, field = us.family_grid("bout_mms", 8, seed=99)
     with pytest.raises(ValueError):
         us.add_k2_to_file(path, other, field)
+
+
+def test_k2_tiny_grids():
+    # Regression (BOUT-dev test-petsc-operators-unstructured, 5 x 4 nodes,
+    # periodic in Z): the nearest points include further periodic images of
+    # one node; the stencils must use distinct nodes, and planes with too few
+    # nodes for the quadratic fit fall back to smaller stencils or lin
+    field = zbfield.Slab(By=1.0, Bz=0.3, Bzprime=0.0)
+    for (nR, nZ), order, kw in (
+        ((5, 4), 2, {}),
+        ((3, 4), 2, {"map_order": 1, "dagp_order": 1, "strict": False}),
+        ((2, 4), 1, {"map_order": 1, "dagp_order": 1, "strict": False}),
+    ):
+        pol = us.UnstructuredPoloidalGrid.slab(
+            nR, nZ, 1.0, 1.0, R0=1.5, jitter=0.2, jitter_dirs="z", seed=7
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            _, data, stats = us.make_unstructured_grid(
+                None, pol, field, ny=16, Ly=10.0, walls_y=True, **kw
+            )
+        st = stats["k2"]
+        assert list(st["order_counts"]) == [order], (nR, nZ, st["order_counts"])
+        assert st["reconstruction_error"] < 1e-12
+        assert "k2_forward_weights" in data

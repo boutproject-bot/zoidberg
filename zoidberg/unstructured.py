@@ -2177,7 +2177,10 @@ def _k2_reconstruction(pol, candidates, order, max_cond=1e6):
     in this direction is interior).
 
     For order 2 ("quadF") the fit is quadratic, with the value fixed at the
-    dof, over the 14 nearest candidates; order 1 ("lin") is linear over 8.
+    dof, over the 14 nearest candidates; order 1 ("lin") is linear over 8
+    (on small planes with fewer candidates: all of them, if that is at least
+    two more than the number of coefficients). The neighbours are distinct
+    nodes, each at its nearest periodic image.
     Distances are Euclidean (minimum image), weights ``1/(d^2/<d^2> + 0.1)``.
     A stencil whose scaled least-squares matrix has a condition number
     above ``max_cond`` grows (k, k+6, k+14 neighbours), then drops to the
@@ -2197,10 +2200,13 @@ def _k2_reconstruction(pol, candidates, order, max_cond=1e6):
     kmax = 0
     attempts = []
     for p in range(order, 0, -1):
-        for kk in (sizes[p], sizes[p] + 6, sizes[p] + 14):
-            if kk <= nc - 1 and num_coefs(p) - 1 <= kk:
-                attempts.append((p, kk))
-                kmax = max(kmax, kk)
+        sizes_p = [kk for kk in (sizes[p], sizes[p] + 6, sizes[p] + 14) if kk < nc]
+        if not sizes_p and nc - 1 >= num_coefs(p) + 1:
+            # Small plane: as many neighbours as there are
+            sizes_p = [nc - 1]
+        for kk in sizes_p:
+            attempts.append((p, kk))
+            kmax = max(kmax, kk)
     nb = np.repeat(np.arange(n)[:, None], max(kmax, 1), axis=1)
     P = np.zeros((n, 5, max(kmax, 1)))
     used = np.full(n, -1)
@@ -2213,10 +2219,34 @@ def _k2_reconstruction(pol, candidates, order, max_cond=1e6):
     shifts = _periodic_shifts(pol)
     big = np.concatenate([X[cand] + s for s in shifts])
     tree = cKDTree(big)
-    dist, idx = tree.query(X[cand], kmax + 1)
-    if np.any(dist[:, 0] > 0):
+    # Nearest distinct candidates other than the dof itself, each at its
+    # nearest periodic image: on small periodic planes the nearest points
+    # include further images of one node (or of the dof), which would make
+    # the stencil inconsistent with a local polynomial
+    kq = min(len(big), kmax + 1)
+    while True:
+        dist, idx = tree.query(X[cand], kq)
+        dist, idx = np.atleast_2d(dist), np.atleast_2d(idx)
+        node = idx % nc
+        srt = np.sort(node, axis=1, kind="stable")
+        dup = np.zeros(node.shape, dtype=bool)
+        # a point is a duplicate if its node appeared earlier in the row
+        # (rows are sorted by distance, so the first is the nearest image)
+        order = np.argsort(node, axis=1, kind="stable")
+        same = np.zeros(node.shape, dtype=bool)
+        same[:, 1:] = srt[:, 1:] == srt[:, :-1]
+        np.put_along_axis(dup, order, same, axis=1)
+        dup |= node == np.arange(nc)[:, None]
+        n_ok = np.sum(~dup, axis=1)
+        if np.all(n_ok >= kmax) or kq == len(big):
+            break
+        kq = min(len(big), 2 * kq)
+    if np.any(dist[:, 0] > 0) or np.any(node[:, 0] != np.arange(nc)):
         raise AssertionError("K2 reconstruction: the dof is not its own neighbour")
-    idx = idx[:, 1:]
+    if np.any(n_ok < kmax):
+        raise AssertionError("K2 reconstruction: too few distinct neighbours")
+    keep = np.argsort(dup, axis=1, kind="stable")[:, :kmax]
+    idx = np.take_along_axis(idx, keep, axis=1)
     r = big[idx] - X[cand][:, None, :]
     nbr = cand[idx % nc]
     done = np.zeros(nc, dtype=bool)
