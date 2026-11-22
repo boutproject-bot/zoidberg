@@ -946,7 +946,8 @@ def test_lsq_blocks_and_repeated_targets_identical():
 
 
 def test_parallel_planes_identical():
-    # dagp_unstructured with worker processes gives the same arrays
+    # dagp_unstructured and the K2 traces with worker processes give the same
+    # arrays
     planes = [
         us.UnstructuredPoloidalGrid.slab(
             8, 8, 1.0, 1.0, jitter=0.2, jitter_dirs="z", seed=20 + j

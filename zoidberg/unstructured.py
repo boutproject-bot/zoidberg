@@ -2493,6 +2493,19 @@ def _k2_vertices(pol, tri):
     return w[first], inverse.ravel()
 
 
+_K2_TRACE = None  # (tracer, rtol) inherited by the trace workers of k2_divergence
+
+
+def _k2_trace_task(points, y0, y1, trace=None):
+    """Positions in the plane at y1 of the points of the plane at y0
+    (``trace`` = (tracer, rtol), by default the inherited ``_K2_TRACE``)"""
+    tracer, rtol = _K2_TRACE if trace is None else trace
+    traced = np.array(
+        tracer.follow_field_lines(points[:, 0], points[:, 1], [y0, y1], rtol=rtol)
+    )
+    return traced[-1]
+
+
 def k2_divergence(
     grid,
     field,
@@ -2667,20 +2680,41 @@ def k2_divergence(
             R, Z = pullback(points[:, 0], points[:, 1], j, sign)
             return np.column_stack([R, Z])
         y0 = grid.ycoords[j] + sign * dyj[j]
-        traced = np.array(
-            tracer.follow_field_lines(
-                points[:, 0], points[:, 1], [y0, grid.ycoords[j]], rtol=rtol
-            )
-        )
-        return traced[-1]
+        return _k2_trace_task(points, y0, grid.ycoords[j], (tracer, rtol))
 
     levels_traced = 1 if refine == "auto" else int(refine)
     pulled = []
     max_dev = 0.0
-    for name, sign, j, jd, interior in items:
+    # The traces of the items are independent: in parallel if processes > 1
+    # (fork, so that the tracer is inherited rather than pickled)
+    traced_items = [None] * len(items)
+    if processes > 1 and pullback is None and len(items) > 1:
+        import multiprocessing
+        from concurrent.futures import ProcessPoolExecutor
+
+        global _K2_TRACE
+        _K2_TRACE = (tracer, rtol)
+        try:
+            with ProcessPoolExecutor(
+                max_workers=processes, mp_context=multiprocessing.get_context("fork")
+            ) as ex:
+                futures = [
+                    ex.submit(
+                        _k2_trace_task,
+                        dest_triangles(grid.plane(jd), levels_traced)[2],
+                        grid.ycoords[j] + sign * dyj[j],
+                        grid.ycoords[j],
+                    )
+                    for _, sign, j, jd, _ in items
+                ]
+                traced_items = [f.result() for f in futures]
+        finally:
+            _K2_TRACE = None
+    for it, (name, sign, j, jd, interior) in enumerate(items):
         dst = grid.plane(jd)
         td, od, verts, inv = dest_triangles(dst, levels_traced)
-        disp = pull(verts, j, sign) - verts
+        end = traced_items[it] if traced_items[it] is not None else pull(verts, j, sign)
+        disp = end - verts
         tdp = td + disp[inv].reshape(td.shape)
         if refine == "auto":
             # Affine test: traced midpoints of the first refinement against
