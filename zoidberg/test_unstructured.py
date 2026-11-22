@@ -1241,3 +1241,68 @@ def test_same_plane_twice_gives_the_same_grid():
         )
     assert results[0] == results[1]
     assert pol.in_domain(pol.points).all()
+
+
+def test_wall_options_keep_wall_nodes_out_of_the_maps():
+    # Field lines that cross the walls (constant B_R): map_walls=False keeps
+    # the Dirichlet wall nodes out of the parallel-map stencils, and
+    # near_wall_hits=True makes end points whose nearest node is a wall node
+    # wall hits
+    class Tilted(zbfield.Slab):
+        def __init__(self):
+            super().__init__(By=1.0, Bz=0.05, Bzprime=0.0)
+
+        def Bxfunc(self, x, z, phi):
+            return np.full(np.shape(x), 0.4)
+
+    pol = us.UnstructuredPoloidalGrid.slab(
+        9,
+        8,
+        1.0,
+        1.0,
+        R0=1.5,
+        jitter=0.2,
+        jitter_dirs="z",
+        periodic_R=False,
+        periodic_Z=True,
+        seed=3,
+        r_on_walls=True,
+    )
+    pol.walls = (
+        np.flatnonzero(np.isclose(pol.R, 1.5)),
+        np.flatnonzero(np.isclose(pol.R, 2.5)),
+    )
+    ny = 6
+    grid = us.UnstructuredGrid(
+        pol,
+        np.linspace(0, 2 * np.pi, ny, endpoint=False),
+        2 * np.pi,
+        dirichlet_walls=True,
+    )
+    field = Tilted()
+    maps = us.trace_maps(grid, field)
+    near = us.trace_maps(grid, field, near_wall_hits=True)
+    wall = np.concatenate(pol.walls)
+    plasma = np.setdiff1d(np.arange(pol.n_nodes), wall)
+    for name in ("forward", "backward"):
+        hit, hit_near = maps[f"{name}_hit"] != 0, near[f"{name}_hit"] != 0
+        assert np.all(hit_near[hit]) and hit_near.sum() > hit.sum()
+        # No interior end point is closer to a wall node than to a plasma node
+        pos = np.column_stack(
+            (near[f"{name}_R"][~hit_near], near[f"{name}_Z"][~hit_near])
+        )
+        d_wall = np.min(
+            np.linalg.norm(pos[:, None] - pol.points[wall][None], axis=2), axis=1
+        )
+        d_plasma = np.min(
+            np.linalg.norm(pos[:, None] - pol.points[plasma][None], axis=2), axis=1
+        )
+        assert np.all(d_plasma <= d_wall)
+    # Wall cells are numbered after the evolving cells
+    n_evolving = int(np.sum(grid.interior)) * ny
+    n_wall = (pol.n_nodes - int(np.sum(grid.interior))) * ny
+    for map_walls in (True, False):
+        som, _ = us.som_weights(grid, near, map_walls=map_walls)
+        cols = np.concatenate([som["forward_columns"], som["backward_columns"]])
+        in_wall = (cols >= n_evolving) & (cols < n_evolving + n_wall)
+        assert in_wall.any() == map_walls

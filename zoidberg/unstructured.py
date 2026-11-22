@@ -857,6 +857,7 @@ class UnstructuredPoloidalGrid:
         strict=False,
         weight_power=0.0,
         eval_offsets=None,
+        nodes=None,
     ):
         """Least-squares value (and gradient) weights at target points.
 
@@ -867,15 +868,17 @@ class UnstructuredPoloidalGrid:
         polynomial at ``target + offset``. ``info`` contains
         ``fallback`` (number of points that dropped to a lower order) and
         ``snapped`` (number of injections). Value weights are exact for
-        polynomials of total degree <= order.
+        polynomials of total degree <= order. ``nodes`` (index array) restricts
+        the stencils to these nodes (default: all nodes).
         """
         targets = np.atleast_2d(np.asarray(targets, dtype=float))
         m = len(targets)
         k0 = num_coefs(order) + extra
-        if k0 > self.n_nodes:
+        n_avail = self.n_nodes if nodes is None else len(nodes)
+        if k0 > n_avail:
             raise ValueError(
                 f"Need at least {k0} nodes for an order-{order} stencil, "
-                f"mesh has {self.n_nodes}"
+                f"mesh has {n_avail}"
             )
         # The fits are independent per target: process the targets in blocks
         # so that the work arrays (Vandermonde matrices, SVDs, pseudo-
@@ -900,6 +903,7 @@ class UnstructuredPoloidalGrid:
                             eval_offsets=None
                             if eval_offsets is None
                             else np.asarray(eval_offsets, dtype=float)[sl],
+                            nodes=nodes,
                         )
                     )
             info = {
@@ -930,11 +934,15 @@ class UnstructuredPoloidalGrid:
 
         # Stencils grow before they drop in order: next to a wall, the k0
         # nearest nodes can span too few layers for a full-order fit.
-        k_list = [kk for kk in (k0, k0 + 6, k0 + 14) if kk <= self.n_nodes]
+        k_list = [kk for kk in (k0, k0 + 6, k0 + 14) if kk <= n_avail]
         kmax = k_list[-1]
         tree = self._tree()
+        if nodes is not None:
+            tree = KDTree(self._scaled(self.dof[nodes]), boxsize=self._tree_box)
         _, inds_all = tree.query(self._scaled(targets), k=kmax)
         inds_all = np.atleast_2d(inds_all)
+        if nodes is not None:
+            inds_all = np.asarray(nodes)[inds_all]
         offsets = self.minimum_image(self.dof[inds_all] - targets[:, None, :])
         u_all = offsets[..., 0] / self.h[0]
         v_all = offsets[..., 1] / self.h[1]
@@ -1210,7 +1218,9 @@ class UnstructuredGrid:
 # Field-line maps
 
 
-def trace_maps(grid, field, rtol=1e-10, field_tracer=None, domain_tol=1e-9):
+def trace_maps(
+    grid, field, rtol=1e-10, field_tracer=None, domain_tol=1e-9, near_wall_hits=False
+):
     """Trace field lines from every node to the neighbouring planes.
 
     Returns a dict with per-plane arrays of shape ``(ny, n_nodes)``:
@@ -1222,9 +1232,11 @@ def trace_maps(grid, field, rtol=1e-10, field_tracer=None, domain_tol=1e-9):
     marked ``walls`` the hit is on the wall with the nearest wall node,
     otherwise on the outer wall if R is above the mesh centre. End points
     within about ``domain_tol`` node spacings outside the mesh count as
-    inside (their stencils extrapolate slightly); this plays the role of
-    the manual correction of ``xt_prime`` next to traced flux-surface walls
-    in structured stellarator grids.
+    inside (their stencils extrapolate slightly), so that round-off at the
+    mesh edge does not create wall hits. With ``near_wall_hits`` (planes with
+    marked walls only), end points whose nearest node is a wall node are
+    wall hits too, so that the sheath at the parallel boundary takes them
+    instead of an extrapolation next to the wall.
     """
     tracer = field_tracer or fieldtracer.FieldTracer(field)
     ny, n = grid.ny, grid.n_nodes
@@ -1263,8 +1275,12 @@ def trace_maps(grid, field, rtol=1e-10, field_tracer=None, domain_tol=1e-9):
             if target.walls is not None and len(target.walls[1]):
                 w_in, w_out = target.walls
                 wall_nodes = np.concatenate([w_in, w_out])
-                _, near = KDTree(target.points[wall_nodes]).query(pos)
+                d_wall, near = KDTree(target.points[wall_nodes]).query(pos)
                 outer = near >= len(w_in)
+                if near_wall_hits:
+                    plasma = np.setdiff1d(np.arange(target.n_nodes), wall_nodes)
+                    d_plasma, _ = KDTree(target.points[plasma]).query(pos)
+                    inside &= d_plasma <= d_wall
             else:
                 centre = target.points.mean(axis=0)
                 outer = pos[:, 0] >= centre[0]
@@ -1285,14 +1301,23 @@ def trace_maps(grid, field, rtol=1e-10, field_tracer=None, domain_tol=1e-9):
 
 
 def som_weights(
-    grid, maps, order=4, strict=True, snap_tol=1e-10, extra=16, weight_power=3.0
+    grid,
+    maps,
+    order=4,
+    strict=True,
+    snap_tol=1e-10,
+    extra=16,
+    weight_power=3.0,
+    map_walls=True,
 ):
     """Cell numbering, leg metadata and CSR operators for ``PetscOperators``.
 
     Uses the numbering of :func:`zoidberg.weights.assign_cell_space_numbers`:
     interior cells first (loop order x, y), then (none) X-boundary cells,
     then for each interior cell the backward and forward parallel boundary
-    virtual cells. Legs are single-sample.
+    virtual cells. Legs are single-sample. With ``map_walls=False`` the
+    interpolation stencils use only evolving nodes, so the values at
+    Dirichlet wall nodes do not enter the parallel slices.
     """
     nx, ny, _ = grid.shape
     node_x = grid.node_x
@@ -1372,6 +1397,7 @@ def som_weights(
                     weight_power=weight_power,
                     strict=strict,
                     snap_tol=snap_tol,
+                    nodes=None if map_walls else np.flatnonzero(grid.interior),
                 )
                 stats["fallback"] += info["fallback"]
                 stats["snapped"] += info["snapped"]
@@ -2884,6 +2910,8 @@ def build_grid_data(
     domain_tol=1e-9,
     map_extra=16,
     map_weight_power=3.0,
+    map_walls=True,
+    near_wall_hits=False,
     dagp_extra=16,
     value_order=2,
     processes=1,
@@ -2905,8 +2933,13 @@ def build_grid_data(
     the test grids). ``domain_tol``: see :func:`trace_maps`. ``map_extra``
     and ``map_weight_power`` set the stencil size (``num_coefs(map_order) +
     map_extra`` nodes) and the distance weighting of the parallel-map fits
-    (see :meth:`UnstructuredPoloidalGrid.lsq_weights`). ``dagp_extra`` is
-    the number of extra nodes of the face-gradient fits (16 by default, needed
+    (see :meth:`UnstructuredPoloidalGrid.lsq_weights`); ``map_walls=False``
+    keeps the Dirichlet wall nodes out of the parallel-map stencils (see
+    :func:`som_weights`); ``near_wall_hits``: see :func:`trace_maps`.
+    Without ``near_wall_hits`` the stencils of end points next to a wall
+    extrapolate one-sidedly, so use ``map_walls=False`` only together with
+    ``near_wall_hits=True``. ``dagp_extra`` is the number of extra nodes of
+    the face-gradient fits (16 by default, needed
     on coarse anisotropic meshes; 4 is enough on near-isotropic gmsh meshes)
     and ``value_order`` the order of the separate fit for the face values of
     the coefficient a (2 by default: second order with about a third of the
@@ -2920,7 +2953,9 @@ def build_grid_data(
     ``k2_refine`` and ``k2_tube_volume``; ``k2=False`` skips them (faster, for tests that
     do not need them).
     """
-    maps = trace_maps(grid, field, rtol=rtol, domain_tol=domain_tol)
+    maps = trace_maps(
+        grid, field, rtol=rtol, domain_tol=domain_tol, near_wall_hits=near_wall_hits
+    )
     som, som_stats = som_weights(
         grid,
         maps,
@@ -2928,6 +2963,7 @@ def build_grid_data(
         strict=strict,
         extra=map_extra,
         weight_power=map_weight_power,
+        map_walls=map_walls,
     )
     dagp, dagp_stats = dagp_unstructured(
         grid,
@@ -3314,7 +3350,15 @@ def family_grid(family, n, **kwargs):
     return grid, field
 
 
-def add_k2_to_file(filename, grid, field, rtol=1e-10, domain_tol=1e-9, **k2_options):
+def add_k2_to_file(
+    filename,
+    grid,
+    field,
+    rtol=1e-10,
+    domain_tol=1e-9,
+    near_wall_hits=False,
+    **k2_options,
+):
     """Add (or overwrite) the ``k2_*`` variables of an existing unstructured
     grid file, without regenerating its other variables.
 
@@ -3325,8 +3369,9 @@ def add_k2_to_file(filename, grid, field, rtol=1e-10, domain_tol=1e-9, **k2_opti
     classification must agree to 1e-10 (relative to the node spacing).
     The numbering, the leg stencils, ``dy``, ``g_22`` and ``dagp_us_volume``
     are read from the file, so the matrices match its other variables.
-    ``rtol`` and ``domain_tol`` as for :func:`build_grid_data`; further
-    options go to :func:`k2_divergence`. Returns the statistics.
+    ``rtol``, ``domain_tol`` and ``near_wall_hits`` as for
+    :func:`build_grid_data`; further options go to :func:`k2_divergence`.
+    Returns the statistics.
     """
     import os
 
@@ -3372,7 +3417,9 @@ def add_k2_to_file(filename, grid, field, rtol=1e-10, domain_tol=1e-9, **k2_opti
     for c, key in enumerate(("R", "Z")):
         if np.max(np.abs(grid.to3d(dof[..., c]) - data[key])) > 1e-10 * h:
             raise ValueError(f"{key} of the grid does not match the file")
-    maps = trace_maps(grid, field, rtol=rtol, domain_tol=domain_tol)
+    maps = trace_maps(
+        grid, field, rtol=rtol, domain_tol=domain_tol, near_wall_hits=near_wall_hits
+    )
     ev = grid.interior
     for d in ("forward", "backward"):
         for c in ("R", "Z"):
