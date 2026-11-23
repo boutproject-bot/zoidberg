@@ -152,6 +152,59 @@ def test_injection_maps_in_grid_file(tmp_path):
         assert n_legs == np.count_nonzero(cell >= 0)
 
 
+@pytest.mark.parametrize("periodic_Z", [True, False])
+def test_field_aligned_single_plane_maps(tmp_path, periodic_Z):
+    # Field-aligned mesh in one poloidal plane: the lines of constant R are
+    # flux tubes, and one turn in y moves a field line by one node spacing in
+    # Z. Every interior map row must then be an exact injection onto the next
+    # node of the same tube, in the same plane. An open tube (not periodic in
+    # Z) must end in one parallel-boundary leg per direction
+    nR, nZ, Lz, Ly = 6, 8, 1.0, 10.0
+    hZ = Lz / nZ
+    pol = us.UnstructuredPoloidalGrid.slab(
+        nR,
+        nZ,
+        0.1,
+        Lz,
+        R0=-0.05,
+        Z0=0.0,
+        jitter=0.0,
+        periodic_R=False,
+        periodic_Z=periodic_Z,
+        relax=False,
+    )
+    field = zbfield.Slab(By=1.0, Bz=hZ / Ly, Bzprime=0.0)
+    _grid, d, _stats = us.make_unstructured_grid(
+        str(tmp_path / "g.nc"), pol, field, ny=1, Ly=Ly, k2=False
+    )
+    cell = np.asarray(d["cell_number"])[:, 0, 0]
+    R, Z = np.asarray(d["R"])[:, 0, 0], np.asarray(d["Z"])[:, 0, 0]
+    node = {int(c): x for x, c in enumerate(cell) if c >= 0}
+    for name, step in (("forward", 1), ("backward", -1)):
+        rows = np.asarray(d[f"{name}_rows"])
+        cols = np.asarray(d[f"{name}_columns"])
+        weights = np.asarray(d[f"{name}_weights"])
+        legs = np.asarray(d[f"{name}_leg_interior_number"])[:, 0, 0]
+        ends = np.asarray(d[f"{name}_leg_boundary_number"])[:, 0, 0] >= 0
+        assert np.all(np.diff(rows) == 1)
+        assert np.all(weights == 1.0)
+        for x in np.flatnonzero(legs >= 0):
+            xt = node[int(cols[rows[legs[x]]])]
+            assert xt != x
+            assert R[xt] == pytest.approx(R[x], abs=1e-12)
+            dZ = Z[xt] - Z[x] - step * hZ
+            if periodic_Z:
+                dZ = (dZ + 0.5 * Lz) % Lz - 0.5 * Lz
+            assert dZ == pytest.approx(0.0, abs=1e-12)
+        if periodic_Z:
+            assert not np.any(ends)
+        else:
+            # The last node of each tube in the direction of the leg
+            assert np.count_nonzero(ends) == nR
+            last = Z.max() if step > 0 else Z.min()
+            assert Z[ends] == pytest.approx(last, abs=1e-12)
+
+
 def test_dagp_laplacian_quadratic():
     # div(grad(R^2 + Z^2)) = 4, with a = 1, on a doubly periodic mesh using a
     # locally defined quadratic (minimum image from each node). Instead,
