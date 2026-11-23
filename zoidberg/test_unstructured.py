@@ -1131,7 +1131,7 @@ def test_k2_order0_equals_support_operator():
     pol = strip(nR=8, nZ=8)
     field = zbfield.Slab(By=1.0, Bz=0.0, Bzprime=0.0)
     _, data, stats = us.make_unstructured_grid(
-        None, pol, field, ny=4, Ly=10.0, yperiodic=False, k2_order=0
+        None, pol, field, ny=4, Ly=10.0, yperiodic=False, k2_order=0, k2=True
     )
     assert stats["k2"]["order"] == 0
     so, _ = _support_half_divergences(data)
@@ -1152,7 +1152,7 @@ def test_k2_reference_matrices():
     # field lines, which agree with the analytic maps to round-off here
     ref = np.load(Path(__file__).parent / "test_data" / "k2_reference.npz")
     for family in ("bout_mms", "bout_mms_cyl_sheared"):
-        _, data, stats = us.make_test_grid(family, 16, k2_refine=0)
+        _, data, stats = us.make_test_grid(family, 16, k2_refine=0, k2=True)
         assert stats["k2"]["tube_volume"] == "dV"
         nc = int(data["total_cells"])
         cn = data["cell_number"][..., 0]
@@ -1206,10 +1206,14 @@ def test_k2_gmsh_walls():
 def test_k2_variables_in_grid_file(tmp_path):
     pol = strip(nR=8, nZ=8)
     field = zbfield.Slab(Bz=0.05, Bzprime=0.1)
-    us.make_unstructured_grid(str(tmp_path / "g.nc"), pol, field, ny=4, Ly=10.0)
+    us.make_unstructured_grid(
+        str(tmp_path / "g.nc"), pol, field, ny=4, Ly=10.0, k2=True
+    )
     us.make_unstructured_grid(
         str(tmp_path / "n.nc"), pol, field, ny=4, Ly=10.0, k2=False
     )
+    # Default: K2 only with centroid unknowns (not on this strip)
+    us.make_unstructured_grid(str(tmp_path / "a.nc"), pol, field, ny=4, Ly=10.0)
     from boututils.datafile import DataFile
 
     with DataFile(str(tmp_path / "g.nc")) as f:
@@ -1225,8 +1229,9 @@ def test_k2_variables_in_grid_file(tmp_path):
             for r in range(nc):
                 c = cols[rows[r] : rows[r + 1]]
                 assert len(np.unique(c)) == len(c)
-    with DataFile(str(tmp_path / "n.nc")) as f:
-        assert not any(k.startswith("k2_") for k in f.list())
+    for name in ("n.nc", "a.nc"):
+        with DataFile(str(tmp_path / name)) as f:
+            assert not any(k.startswith("k2_") for k in f.list())
 
 
 def test_add_k2_to_file(tmp_path):
@@ -1239,7 +1244,7 @@ def test_add_k2_to_file(tmp_path):
     grid, field = us.family_grid("bout_mms", 8)
     for order in (1, 2):
         us.add_k2_to_file(path, grid, field, order=order)
-        _, ref, _ = us.make_test_grid("bout_mms", 8, k2_order=order)
+        _, ref, _ = us.make_test_grid("bout_mms", 8, k2_order=order, k2=True)
         with DataFile(path) as f:
             assert int(f["k2_order"]) == order
             for d in ("forward", "backward"):
@@ -1270,7 +1275,7 @@ def test_k2_tiny_grids():
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             _, data, stats = us.make_unstructured_grid(
-                None, pol, field, ny=16, Ly=10.0, walls_y=True, **kw
+                None, pol, field, ny=16, Ly=10.0, walls_y=True, k2=True, **kw
             )
         st = stats["k2"]
         assert list(st["order_counts"]) == [order], (nR, nZ, st["order_counts"])
@@ -1369,7 +1374,12 @@ def test_wall_options_keep_wall_nodes_out_of_the_maps():
         assert in_wall.any() == map_walls
         # The K2 tubes deposit into the wall-node rows only with map_walls
         data, _ = us.build_grid_data(
-            grid, field, map_walls=map_walls, near_wall_hits=True, perp_walls=map_walls
+            grid,
+            field,
+            map_walls=map_walls,
+            near_wall_hits=True,
+            perp_walls=map_walls,
+            k2=True,
         )
         for name in ("k2_forward", "k2_backward"):
             rows = data[f"{name}_rows"]

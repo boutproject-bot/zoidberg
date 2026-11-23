@@ -3082,7 +3082,7 @@ def build_grid_data(
     dagp_extra=16,
     value_order=2,
     processes=1,
-    k2=True,
+    k2="auto",
     k2_order=2,
     k2_refine="auto",
     k2_tube_volume="auto",
@@ -3117,11 +3117,15 @@ def build_grid_data(
     ``processes`` is the number of worker processes for the perpendicular
     operator of the planes (see :func:`dagp_unstructured`; each worker holds
     one plane, about 0.3 GB for a 7000-node gmsh plane).
-    ``k2`` (default True) also computes the flux-reconstructed conservative
+    ``k2=True`` also computes the flux-reconstructed conservative
     parallel half-divergences ``k2_*`` (see :func:`k2_divergence`) with
     reconstruction order ``k2_order`` (2 = quadratic, 1 = linear),
     ``k2_refine`` and ``k2_tube_volume``; ``k2=False`` skips them (faster, for tests that
-    do not need them).
+    do not need them). The default ``"auto"`` computes them only if every
+    plane has its unknowns at the dual-cell centroids
+    (:meth:`UnstructuredPoloidalGrid.use_centroid_dofs`): next to walls
+    K2 is second order only with centroid unknowns, and Hermes-3 uses K2 by
+    default when the grid file has the matrices.
     """
     maps = trace_maps(
         grid, field, rtol=rtol, domain_tol=domain_tol, near_wall_hits=near_wall_hits
@@ -3177,6 +3181,8 @@ def build_grid_data(
         if not np.array_equal(legs >= 0, hit[:, evolving] == 0):
             raise AssertionError(f"{name}: leg classification disagrees with xt_prime")
     k2_stats = None
+    if k2 == "auto":
+        k2 = all(grid.plane(j).centroid_dofs for j in range(grid.ny))
     if k2:
         k2_data, k2_stats = k2_divergence(
             grid,
