@@ -3479,8 +3479,8 @@ def add_k2_to_file(
     The numbering, the leg stencils, ``dy``, ``g_22`` and ``dagp_us_volume``
     are read from the file, so the matrices match its other variables.
     ``rtol``, ``domain_tol`` and ``near_wall_hits`` as for
-    :func:`build_grid_data`; further options go to :func:`k2_divergence`.
-    Returns the statistics.
+    :func:`build_grid_data`; further options go to :func:`k2_divergence`
+    (pass the same ``map_walls`` as for the file). Returns the statistics.
     """
     import os
 
