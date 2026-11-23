@@ -218,13 +218,48 @@ def _curve_length(c):
     return float(np.sum(np.hypot(d[:, 0], d[:, 1])))
 
 
+def _merge_close_points(pts, tol):
+    """The points of the closed polygon ``pts`` without those closer than
+    ``tol`` to the previous kept point (or, for the last, to the first)."""
+    keep = [0]
+    for k in range(1, len(pts)):
+        if np.hypot(*(pts[k] - pts[keep[-1]])) >= tol:
+            keep.append(k)
+    if len(keep) > 1 and np.hypot(*(pts[keep[-1]] - pts[0])) < tol:
+        keep.pop()
+    return pts[keep]
+
+
+def _segment_counts(pts, n):
+    """Nodes per segment of the closed polygon ``pts`` (proportional to the
+    segment lengths, at least one each), ``n`` in total."""
+    seg = np.hypot(*np.diff(np.vstack([pts, pts[:1]]), axis=0).T)
+    if n < len(seg):
+        raise ValueError(f"{n} wall nodes for a polygon with {len(seg)} segments")
+    share = n * seg / seg.sum()
+    k = np.maximum(1, np.floor(share).astype(int))
+    while k.sum() < n:
+        k[np.argmax(share - k)] += 1
+    while k.sum() > n:
+        k[np.argmax(np.where(k > 1, k - share, -np.inf))] -= 1
+    return k
+
+
 def _gmsh_mesh(
-    loops, counts, mesh_size, embed=None, wall_size=None, wall_distance=None
+    loops,
+    counts,
+    mesh_size,
+    embed=None,
+    wall_size=None,
+    wall_distance=None,
+    polygon=False,
 ):
     """Triangulate the region bounded by closed curves with gmsh.
 
     ``loops[0]`` is the outer boundary, further loops are holes; each is a
-    closed spline with ``counts[i]`` equally spaced nodes (transfinite). With
+    closed spline with ``counts[i]`` equally spaced nodes (transfinite), or
+    with ``polygon`` a closed polygon of straight segments (corners kept)
+    with ``counts[i]`` nodes distributed by segment length. With
     ``embed``, these interior points are fixed mesh nodes and no other
     interior nodes are inserted. With ``wall_size``, the triangle size grows
     linearly from ``wall_size`` at ``loops[0]`` to ``mesh_size`` at the
@@ -241,10 +276,17 @@ def _gmsh_mesh(
         curves, curve_loops = [], []
         for pts, n in zip(loops, counts):
             tags = [geo.addPoint(r, z, 0.0, mesh_size) for r, z in pts]
-            spline = geo.addSpline(tags + [tags[0]])
-            geo.mesh.setTransfiniteCurve(spline, n + 1)
-            curves.append(spline)
-            curve_loops.append(geo.addCurveLoop([spline]))
+            if polygon:
+                lines = []
+                per_segment = _segment_counts(pts, n)
+                for k, (a, b) in enumerate(zip(tags, tags[1:] + tags[:1])):
+                    lines.append(geo.addLine(a, b))
+                    geo.mesh.setTransfiniteCurve(lines[-1], per_segment[k] + 1)
+            else:
+                lines = [geo.addSpline(tags + [tags[0]])]
+                geo.mesh.setTransfiniteCurve(lines[0], n + 1)
+            curves.append(lines)
+            curve_loops.append(geo.addCurveLoop(lines))
         surface = geo.addPlaneSurface(curve_loops)
         embedded = []
         if embed is not None:
@@ -253,7 +295,7 @@ def _gmsh_mesh(
         if wall_size is not None and not embedded:
             field = gmsh.model.mesh.field
             dist = field.add("Distance")
-            field.setNumbers(dist, "CurvesList", [curves[0]])
+            field.setNumbers(dist, "CurvesList", curves[0])
             field.setNumber(dist, "Sampling", 4 * counts[0])
             grade = field.add("Threshold")
             field.setNumber(grade, "InField", dist)
@@ -279,7 +321,15 @@ def _gmsh_mesh(
         _, conn = gmsh.model.mesh.getElementsByType(2, surface)
         tags, coords, _ = gmsh.model.mesh.getNodes()
         wall_tags = [
-            gmsh.model.mesh.getNodes(1, c, includeBoundary=True)[0] for c in curves
+            np.unique(
+                np.concatenate(
+                    [
+                        gmsh.model.mesh.getNodes(1, c, includeBoundary=True)[0]
+                        for c in cs
+                    ]
+                )
+            )
+            for cs in curves
         ]
     finally:
         gmsh.finalize()
@@ -392,6 +442,7 @@ class UnstructuredPoloidalGrid:
         centroid_dofs=True,
         wall_size=None,
         wall_distance=None,
+        polygon=False,
     ):
         """Mesh a disc or annulus with gmsh (Delaunay triangulation).
 
@@ -426,6 +477,10 @@ class UnstructuredPoloidalGrid:
             linearly to ``mesh_size`` at the distance ``wall_distance`` from it
             (e.g. to resolve the layer next to a material wall as finely as a
             flux-aligned structured grid)
+        polygon : bool
+            Mesh the walls as closed polygons of straight segments through the
+            given points (corners kept, e.g. divertor plates and vessel
+            contours from CAD cuts) instead of smooth splines
 
         The nodes are ordered inner wall, interior, outer wall, and
         ``walls`` is set accordingly. gmsh is imported only here.
@@ -442,8 +497,18 @@ class UnstructuredPoloidalGrid:
             int(np.ceil(_curve_length(c) / h)) if n is None else int(n)
             for c, n, h in zip(loops, counts, sizes)
         ]
+        if polygon:
+            # Points closer than 5 % of the mesh size to the previous one
+            # (repeated points, tiny segments of CAD cuts) would give
+            # slivers along the wall
+            loops = [_merge_close_points(c, 0.05 * mesh_size) for c in loops]
         pts, tri, wall_nodes = _gmsh_mesh(
-            loops, counts, mesh_size, wall_size=wall_size, wall_distance=wall_distance
+            loops,
+            counts,
+            mesh_size,
+            wall_size=wall_size,
+            wall_distance=wall_distance,
+            polygon=polygon,
         )
         if n_nodes is not None and len(pts) != n_nodes:
             if len(pts) > n_nodes:
@@ -459,7 +524,9 @@ class UnstructuredPoloidalGrid:
             )
             largest = np.argsort(area, kind="stable")[::-1][: n_nodes - len(pts)]
             embed = np.vstack([pts[~on_wall], P[largest].mean(axis=1)])
-            pts, tri, wall_nodes = _gmsh_mesh(loops, counts, mesh_size, embed=embed)
+            pts, tri, wall_nodes = _gmsh_mesh(
+                loops, counts, mesh_size, embed=embed, polygon=polygon
+            )
             if len(pts) != n_nodes:
                 raise RuntimeError(
                     f"gmsh re-triangulation gave {len(pts)} nodes, expected {n_nodes}"
@@ -3201,6 +3268,7 @@ def gmsh_planes(
     dirichlet_walls=True,
     wall_size=None,
     wall_distance=None,
+    polygon=False,
 ):
     """Mesh every poloidal cross-section independently with gmsh.
 
@@ -3215,7 +3283,7 @@ def gmsh_planes(
     ``dirichlet_walls=True`` (the default; the wall nodes then go into the x
     guard cells), all nodes with ``dirichlet_walls=False``. Pass the same
     ``dirichlet_walls`` as to :class:`UnstructuredGrid`. ``relax``,
-    ``centroid_dofs``, ``wall_size`` and ``wall_distance``: see
+    ``centroid_dofs``, ``wall_size``, ``wall_distance`` and ``polygon``: see
     :meth:`UnstructuredPoloidalGrid.from_gmsh`.
     """
     ny = len(outers)
@@ -3227,7 +3295,7 @@ def gmsh_planes(
     if inners[0] is not None:
         n_inner = int(np.ceil(max(_curve_length(c) for c in inners) / mesh_size))
     kw = {"mesh_size": mesh_size, "n_outer": n_outer, "n_inner": n_inner}
-    kw.update(wall_size=wall_size, wall_distance=wall_distance)
+    kw.update(wall_size=wall_size, wall_distance=wall_distance, polygon=polygon)
     kw["centroid_dofs"] = False  # set after relaxing
     planes = [
         UnstructuredPoloidalGrid.from_gmsh(o, i, relax=False, **kw)

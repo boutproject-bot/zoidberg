@@ -1401,3 +1401,25 @@ def test_field_attributes_in_grid_data():
     R, Z = data["R"][..., 0], data["Z"][..., 0]
     y = np.broadcast_to(grid.ycoords, R.shape)
     np.testing.assert_allclose(data["psi"][..., 0], R**2 + Z + y, rtol=1e-14)
+
+
+def test_gmsh_polygon_walls():
+    # Polygon walls (e.g. a vessel contour and a divertor plate from CAD
+    # cuts): straight segments, every corner is a wall node, a point closer
+    # than 5 % of the mesh size to its neighbour is merged
+    pytest.importorskip("gmsh")
+    outer = np.array([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [1.0005, 1.0], [0.0, 1.0]])
+    hole = np.array([[0.4, 0.4], [0.6, 0.45], [0.55, 0.6]])
+    pol = us.UnstructuredPoloidalGrid.from_gmsh(
+        outer, hole, mesh_size=0.05, polygon=True, centroid_dofs=False
+    )
+    w_in, w_out = pol.walls
+    assert pol.euler_characteristic() == 0
+    assert len(w_out) == int(np.ceil(4.0005 / 0.05))
+    for corners, wall in ((outer[[0, 1, 2, 4]], w_out), (hole, w_in)):
+        d = np.linalg.norm(pol.points[wall][None] - corners[:, None], axis=2)
+        d = d.min(axis=1)
+        assert np.all(d < 1e-12)
+    # No wall node next to the merged point
+    near = np.hypot(*(pol.points[w_out] - [1.0005, 1.0]).T)
+    assert np.sum(near < 0.01) == 1
