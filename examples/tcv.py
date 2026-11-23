@@ -457,98 +457,94 @@ class tcv_x21:
 # %%
 
 
-# Multiplication factor for the resolution.
-fac = 0.5
+if __name__ == "__main__":
+    # Multiplication factor for the resolution.
+    fac = 0.5
 
-# Divertor option. In this script just one.
-divoption = 1
+    # Divertor option. In this script just one.
+    divoption = 1
 
-# Symmetry of the system. We just simulate one 16th of the device here.
-symmetry = 16
+    # Symmetry of the system. We just simulate one 16th of the device here.
+    symmetry = 16
 
+    # Lower plate, inner radial position
+    x1 = 0.74
 
-# Lower plate, inner radial position
-x1 = 0.74
+    # Lower plate, outer radial position
+    x2 = 0.865
 
-# Lower plate, outer radial position
-x2 = 0.865
+    # We assume the divertor is at -0.7, not at -0.75.
+    y_cutoff = -0.70
 
-# We assume the divertor is at -0.7, not at -0.75.
-y_cutoff = -0.70
+    # Inner Wall is at 0.625, we assume it is at 0.62
+    x_cutoff = 0.62
 
-# Inner Wall is at 0.625, we assume it is at 0.62
-x_cutoff = 0.62
+    # tcv_datafolderpath needs the path to the TCV-X21 Github repo
+    # https://github.com/SPCData/TCV-X21
+    tcv_datafolderpath = "I need a path!"
 
-# tcv_datafolderpath needs the path to the TCV-X21 Github repo
-# https://github.com/SPCData/TCV-X21
-tcv_datafolderpath = "I need a path!"
+    if tcv_datafolderpath == "I need a path!":
+        raise ValueError("tcv_datafolderpath needs to be the path to the TCV repo!")
 
-if tcv_datafolderpath == "I need a path!":
-    raise ValueError("tcv_datafolderpath needs to be the path to the TCV repo!")
+    tcv = tcv_x21(tcv_datafolderpath=tcv_datafolderpath)
 
-tcv = tcv_x21(tcv_datafolderpath=tcv_datafolderpath)
-
-
-tcv.divertor(
-    divoption,
-    nx=int(fac * 128 + 4),
-    ny=2,
-    nz=int(1024 * fac),
-    x1=x1,
-    x2=x2,
-    y_cutoff=y_cutoff,
-    x_cutoff=x_cutoff,
-    plotting=0,
-    tracemultiplier=2,
-)
-
-
-# Outboard midplane is at 1.09 here.
-corepos = 1.09
-
-tcv.core(corepos)
-tcv.plot_inner_outer(plot_plates=True)
-
-
-# %%
-
-tcv.create_grids(
-    restrict_size=2560,
-    align=False,
-    inner_ort=True,
-    inner_maxmode=4,
-    nx_inner=2,
-    nx_outer=0,
-    dz_relax=1.75,
-    redistribute=False,
-    slab_diff=0.05,
-)  # 1.75
-
-_, ax = tcv.plot_grid(show=False)
-ax.plot(tcv.outer_line.R, tcv.outer_line.Z)
-plt.show()
-
-
-# %% Create the poloidal grids and create the maps
-
-# write_folder will determine where the grid will be saved.
-write_folder = "I need a path!"
-if write_folder == "I need a path!":
-    raise ValueError(
-        "write_folder needs to contain a path to the destination folder of the grid"
+    tcv.divertor(
+        divoption,
+        nx=int(fac * 128 + 4),
+        ny=2,
+        nz=int(1024 * fac),
+        x1=x1,
+        x2=x2,
+        y_cutoff=y_cutoff,
+        x_cutoff=x_cutoff,
+        plotting=0,
+        tracemultiplier=2,
     )
 
-tcv.write_grids(
-    symmetry=symmetry,
-    axysymmetric=False,
-    write_folder=write_folder,
-    use_outside=False,
-    return_maps=False,
-)
-gc = tcv.correct_grids(write_corrected=True)
+    # Outboard midplane is at 1.09 here.
+    corepos = 1.09
 
-_, ax = plt.subplots()
-for i in range(5):
-    plt.plot(gc.backward_xt_prime[i, 0, :], label=str(i))
-plt.legend()
-plt.show()
+    tcv.core(corepos)
+    tcv.plot_inner_outer(plot_plates=True)
+
+    # %%
+
+    tcv.create_grids(
+        restrict_size=2560,
+        align=False,
+        inner_ort=True,
+        inner_maxmode=4,
+        nx_inner=2,
+        nx_outer=0,
+        dz_relax=1.75,
+        redistribute=False,
+        slab_diff=0.05,
+    )  # 1.75
+
+    _, ax = tcv.plot_grid(show=False)
+    ax.plot(tcv.outer_line.R, tcv.outer_line.Z)
+    plt.show()
+
+    # %% Create the poloidal grids and create the maps
+
+    # write_folder will determine where the grid will be saved.
+    write_folder = "I need a path!"
+    if write_folder == "I need a path!":
+        raise ValueError(
+            "write_folder needs to contain a path to the destination folder of the grid"
+        )
+
+    tcv.write_grids(
+        symmetry=symmetry,
+        axysymmetric=False,
+        write_folder=write_folder,
+        use_outside=False,
+        return_maps=False,
+    )
+    gc = tcv.correct_grids(write_corrected=True)
+
+    _, ax = plt.subplots()
+    for i in range(5):
+        plt.plot(gc.backward_xt_prime[i, 0, :], label=str(i))
+    plt.legend()
+    plt.show()
