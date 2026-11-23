@@ -2411,6 +2411,11 @@ def _k2_pair_task(task):
     # destination mesh (the cell moments minus the pieces) goes to the
     # destination cell that contains the landing point of the field line
     sel = interior[o]
+    walls = task["walls"]
+    if walls is not None:
+        # Wall nodes take no part in the parallel coupling: their parts of
+        # the tubes go to the landing cell, like the parts outside the mesh
+        sel &= ~walls[k]
     o, k, mom, contains = o[sel], k[sel], mom[sel], contains[sel]
     res = (
         cellmom
@@ -2431,8 +2436,9 @@ def _k2_pair_task(task):
         # The tube misses the destination mesh entirely: nearest node to
         # the landing point
         lp = task["landing"][missing]
-        d = dst.minimum_image(dst.dof[None, :, :] - lp[:, None, :])
-        land[missing] = np.argmin(np.sum(d**2, axis=-1), axis=1)
+        cand = np.arange(n_dst) if walls is None else np.flatnonzero(~walls)
+        d = dst.minimum_image(dst.dof[None, cand, :] - lp[:, None, :])
+        land[missing] = cand[np.argmin(np.sum(d**2, axis=-1), axis=1)]
     rsrc = np.flatnonzero(interior)
     o = np.concatenate([o, rsrc])
     k = np.concatenate([k, land[rsrc]])
@@ -2519,6 +2525,7 @@ def k2_divergence(
     refine_tol=1e-3,
     processes=1,
     pullback=None,
+    map_walls=True,
 ):
     """Flux-reconstructed conservative parallel half-divergences ("K2").
 
@@ -2561,7 +2568,10 @@ def k2_divergence(
     that partly leaves the destination mesh deposits the outside part into
     the destination cell containing its landing point (conservative).
     Dirichlet wall nodes (no legs) carry no tube; deposits into them stay
-    in their rows, as with the support operators.
+    in their rows, as with the support operators. With ``map_walls=False``
+    (as for :func:`som_weights`) the parts of the tubes over wall-node
+    cells go to the landing cell instead, so that the flux stays in the
+    evolving cells.
 
     ``order``: 2 = quadratic flux reconstruction (default), 1 = linear
     reconstruction, 0 = constant. ``refine``: the destination dual
@@ -2779,6 +2789,7 @@ def k2_divergence(
             "max_cond": max_cond,
             "seed": it,
             "landing": np.column_stack((maps[f"{name}_R"][j], maps[f"{name}_Z"][j])),
+            "walls": None if map_walls else ~grid.interior,
         }
 
     results = {}
@@ -2969,7 +2980,8 @@ def build_grid_data(
     map_extra`` nodes) and the distance weighting of the parallel-map fits
     (see :meth:`UnstructuredPoloidalGrid.lsq_weights`); ``map_walls=False``
     keeps the Dirichlet wall nodes out of the parallel-map stencils (see
-    :func:`som_weights`); ``near_wall_hits``: see :func:`trace_maps`.
+    :func:`som_weights`) and out of the K2 deposits (see
+    :func:`k2_divergence`); ``near_wall_hits``: see :func:`trace_maps`.
     Without ``near_wall_hits`` the stencils of end points next to a wall
     extrapolate one-sidedly, so use ``map_walls=False`` only together with
     ``near_wall_hits=True``. ``dagp_extra`` is the number of extra nodes of
@@ -3046,6 +3058,7 @@ def build_grid_data(
             tube_volume=k2_tube_volume,
             rtol=rtol,
             processes=processes,
+            map_walls=map_walls,
         )
         data.update(k2_data)
     data["unstructured"] = 1

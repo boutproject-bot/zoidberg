@@ -1307,3 +1307,13 @@ def test_wall_options_keep_wall_nodes_out_of_the_maps():
         cols = np.concatenate([som["forward_columns"], som["backward_columns"]])
         in_wall = (cols >= n_evolving) & (cols < n_evolving + n_wall)
         assert in_wall.any() == map_walls
+        # The K2 tubes deposit into the wall-node rows only with map_walls
+        data, _ = us.build_grid_data(
+            grid, field, map_walls=map_walls, near_wall_hits=True
+        )
+        for name in ("k2_forward", "k2_backward"):
+            rows = data[f"{name}_rows"]
+            weights = data[f"{name}_weights"]
+            in_wall = np.zeros(len(weights), dtype=bool)
+            in_wall[rows[n_evolving] : rows[n_evolving + n_wall]] = True
+            assert np.any(weights[in_wall] != 0) == map_walls
