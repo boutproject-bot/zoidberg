@@ -144,6 +144,7 @@ Parallel divergence ("K2", written by default)
     :func:`add_k2_to_file` adds them to an existing file.
 """
 
+import copy
 import time
 import warnings
 from collections import Counter
@@ -1234,14 +1235,17 @@ def trace_maps(
     within about ``domain_tol`` node spacings outside the mesh count as
     inside (their stencils extrapolate slightly), so that round-off at the
     mesh edge does not create wall hits. With ``near_wall_hits`` (planes with
-    marked walls only), end points whose nearest node is a wall node are
-    wall hits too, so that the sheath at the parallel boundary takes them
-    instead of an extrapolation next to the wall.
+    marked walls only), end points in a triangle with a wall node (between
+    the last plasma nodes and the wall) are wall hits too, as end points
+    beyond the last cell centre on structured grids, so that the sheath at
+    the parallel boundary takes them instead of an extrapolation next to the
+    wall.
     """
     tracer = field_tracer or fieldtracer.FieldTracer(field)
     ny, n = grid.ny, grid.n_nodes
     dy = grid.dy()
     out = {}
+    plasma_meshes = {}  # planes without the triangles that touch a wall
     for name, sign in (("forward", +1), ("backward", -1)):
         Rp = np.zeros((ny, n))
         Zp = np.zeros((ny, n))
@@ -1275,12 +1279,20 @@ def trace_maps(
             if target.walls is not None and len(target.walls[1]):
                 w_in, w_out = target.walls
                 wall_nodes = np.concatenate([w_in, w_out])
-                d_wall, near = KDTree(target.points[wall_nodes]).query(pos)
+                _, near = KDTree(target.points[wall_nodes]).query(pos)
                 outer = near >= len(w_in)
                 if near_wall_hits:
-                    plasma = np.setdiff1d(np.arange(target.n_nodes), wall_nodes)
-                    d_plasma, _ = KDTree(target.points[plasma]).query(pos)
-                    inside &= d_plasma <= d_wall
+                    if id(target) not in plasma_meshes:
+                        on_wall = np.zeros(target.n_nodes, dtype=bool)
+                        on_wall[wall_nodes] = True
+                        sub = copy.copy(target)
+                        for key in ("_centroid_tree", "_centroids"):
+                            sub.__dict__.pop(key, None)
+                        sub.triangles = target.triangles[
+                            ~on_wall[target.triangles].any(axis=1)
+                        ]
+                        plasma_meshes[id(target)] = sub
+                    inside &= plasma_meshes[id(target)].in_domain(pos, tol=domain_tol)
             else:
                 centre = target.points.mean(axis=0)
                 outer = pos[:, 0] >= centre[0]

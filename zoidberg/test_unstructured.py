@@ -1247,8 +1247,8 @@ def test_same_plane_twice_gives_the_same_grid():
 def test_wall_options_keep_wall_nodes_out_of_the_maps():
     # Field lines that cross the walls (constant B_R): map_walls=False keeps
     # the Dirichlet wall nodes out of the parallel-map stencils, and
-    # near_wall_hits=True makes end points whose nearest node is a wall node
-    # wall hits
+    # near_wall_hits=True makes end points between the last plasma nodes and
+    # the wall hits
     class Tilted(zbfield.Slab):
         def __init__(self):
             super().__init__(By=1.0, Bz=0.05, Bzprime=0.0)
@@ -1283,22 +1283,26 @@ def test_wall_options_keep_wall_nodes_out_of_the_maps():
     field = Tilted()
     maps = us.trace_maps(grid, field)
     near = us.trace_maps(grid, field, near_wall_hits=True)
-    wall = np.concatenate(pol.walls)
-    plasma = np.setdiff1d(np.arange(pol.n_nodes), wall)
+    # Triangles without a wall node (Z periodic: unwrapped at vertex 0)
+    on_wall = np.zeros(pol.n_nodes, dtype=bool)
+    on_wall[np.concatenate(pol.walls)] = True
+    tri = pol.points[pol.triangles]
+    tri = tri[:, :1] + pol.minimum_image(tri - tri[:, :1])
+    tri = tri[~on_wall[pol.triangles].any(axis=1)]
     for name in ("forward", "backward"):
         hit, hit_near = maps[f"{name}_hit"] != 0, near[f"{name}_hit"] != 0
         assert np.all(hit_near[hit]) and hit_near.sum() > hit.sum()
-        # No interior end point is closer to a wall node than to a plasma node
-        pos = np.column_stack(
-            (near[f"{name}_R"][~hit_near], near[f"{name}_Z"][~hit_near])
-        )
-        d_wall = np.min(
-            np.linalg.norm(pos[:, None] - pol.points[wall][None], axis=2), axis=1
-        )
-        d_plasma = np.min(
-            np.linalg.norm(pos[:, None] - pol.points[plasma][None], axis=2), axis=1
-        )
-        assert np.all(d_plasma <= d_wall)
+        # Interior end points lie in a triangle without a wall node, all
+        # others are wall hits
+        pos = np.column_stack((near[f"{name}_R"].ravel(), near[f"{name}_Z"].ravel()))
+        v = pol.minimum_image(pos[:, None] - tri[None, :, 0])
+        e1, e2 = tri[None, :, 1] - tri[None, :, 0], tri[None, :, 2] - tri[None, :, 0]
+        det = e1[..., 0] * e2[..., 1] - e1[..., 1] * e2[..., 0]
+        l1 = (v[..., 0] * e2[..., 1] - v[..., 1] * e2[..., 0]) / det
+        l2 = (e1[..., 0] * v[..., 1] - e1[..., 1] * v[..., 0]) / det
+        tol = 1e-8
+        in_plasma = ((l1 >= -tol) & (l2 >= -tol) & (l1 + l2 <= 1 + tol)).any(axis=1)
+        assert np.array_equal(~hit_near.ravel(), in_plasma)
     # Wall cells are numbered after the evolving cells
     n_evolving = int(np.sum(grid.interior)) * ny
     n_wall = (pol.n_nodes - int(np.sum(grid.interior))) * ny
