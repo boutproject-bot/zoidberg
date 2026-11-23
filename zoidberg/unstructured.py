@@ -129,7 +129,7 @@ Metric
     For cylindrical fields the perpendicular operator weights volumes and
     fluxes by R.
 
-Parallel divergence ("K2", written by default)
+Parallel divergence ("K2", by default only with centroid unknowns, see build_grid_data)
     K2: the flux-reconstructed conservative parallel divergence used by
     BOUT++'s conduction method ``petscoperatork2``. ``k2_forward_rows``,
     ``k2_forward_columns``, ``k2_forward_weights`` and the same for
