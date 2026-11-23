@@ -1415,7 +1415,7 @@ def test_gmsh_polygon_walls():
     )
     w_in, w_out = pol.walls
     assert pol.euler_characteristic() == 0
-    assert len(w_out) == int(np.ceil(4.0005 / 0.05))
+    assert len(w_out) == int(np.ceil(4.001 / 0.05))
     for corners, wall in ((outer[[0, 1, 2, 4]], w_out), (hole, w_in)):
         d = np.linalg.norm(pol.points[wall][None] - corners[:, None], axis=2)
         d = d.min(axis=1)

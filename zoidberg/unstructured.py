@@ -480,7 +480,10 @@ class UnstructuredPoloidalGrid:
         polygon : bool
             Mesh the walls as closed polygons of straight segments through the
             given points (corners kept, e.g. divertor plates and vessel
-            contours from CAD cuts) instead of smooth splines
+            contours from CAD cuts) instead of smooth splines. Points closer
+            than 5 % of ``mesh_size`` (also with ``wall_size``) to the
+            previous one are merged; every segment gets at least one wall
+            node, so a contour needs at least as many wall nodes as segments
 
         The nodes are ordered inner wall, interior, outer wall, and
         ``walls`` is set accordingly. gmsh is imported only here.
