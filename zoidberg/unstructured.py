@@ -1281,9 +1281,12 @@ class UnstructuredGrid:
         occupied = np.zeros(self.nx, dtype=bool)
         occupied[self.node_x] = True
         xs = np.flatnonzero(occupied)
-        nearest = xs[
-            np.argmin(np.abs(np.arange(self.nx)[:, None] - xs[None, :]), axis=1)
-        ]
+        # Nearest occupied index, the lower one on ties (sorted search: a
+        # dense nx x n distance array needs GBs for large planes)
+        i = np.arange(self.nx)
+        hi = np.minimum(np.searchsorted(xs, i), len(xs) - 1)
+        lo = np.maximum(hi - 1, 0)
+        nearest = np.where(i - xs[lo] <= np.abs(xs[hi] - i), xs[lo], xs[hi])
         node_at = np.full(self.nx, -1)
         node_at[self.node_x] = np.arange(n)
         self._fill_node = node_at[nearest]
