@@ -606,6 +606,57 @@ def test_gmsh_curved_walls_order():
     assert np.log(errs[0] / errs[1]) / np.log(hs[0] / hs[1]) > 1.8, errs
 
 
+def test_gmsh_graded_mesh_order():
+    # Mesh graded from h/3 at the outer wall to h at 0.1 from it: the
+    # perpendicular operator is second order on the evolving nodes and has
+    # no growing modes
+    pytest.importorskip("gmsh")
+    from scipy.sparse import csr_matrix
+
+    outer, inner = _curved_annulus()
+    errs = []
+    hs = (1 / 12, 1 / 24)
+    for h in hs:
+        pol = us.UnstructuredPoloidalGrid.from_gmsh(
+            outer, inner, mesh_size=h, wall_size=h / 3, wall_distance=0.1
+        )
+        w_out = pol.walls[1]
+        assert np.isclose(len(w_out), us._curve_length(outer) / (h / 3), rtol=0.01)
+        grid = us.UnstructuredGrid(
+            pol, np.array([0.0]), 1.0, dirichlet_walls=True, multiple_of=1
+        )
+        data, stats = us.build_grid_data(grid, zbfield.Slab(Bz=0.0, Bzprime=0.0))
+        assert stats["dagp"]["max_re"] <= 1e-10
+        assert stats["dagp"]["fallback"] == 0
+        cn = data["cell_number"][:, 0, 0]
+        nc, nfp = data["total_cells"], data["dagp_us_n_facepoints"]
+        G, V, D = (
+            csr_matrix(
+                (
+                    data[f"dagp_us_{name}_weights"],
+                    data[f"dagp_us_{name}_columns"],
+                    data[f"dagp_us_{name}_rows"],
+                ),
+                shape=shape,
+            )
+            for name, shape in (
+                ("gradp", (nfp, nc)),
+                ("value", (nfp, nc)),
+                ("div", (nc, nfp)),
+            )
+        )
+        node_cells = cn[grid.node_x]
+        k = 2 * np.pi
+        R, Z = pol.dof[:, 0], pol.dof[:, 1]
+        f = np.zeros(nc)
+        f[node_cells] = np.sin(k * R) * np.cos(k * Z)
+        res = (D @ (V @ np.ones(nc) * (G @ f)))[node_cells]
+        ex = -2 * k * k * np.sin(k * R) * np.cos(k * Z)
+        e = (res - ex)[grid.interior]
+        errs.append(np.sqrt(np.mean(e**2)))
+    assert np.log(errs[0] / errs[1]) / np.log(hs[0] / hs[1]) > 1.8, errs
+
+
 def test_gmsh_planes_equal_counts():
     # Independently meshed planes of different shape get the same node and
     # wall-node counts, as the nodes-along-x layout requires

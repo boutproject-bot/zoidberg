@@ -218,13 +218,17 @@ def _curve_length(c):
     return float(np.sum(np.hypot(d[:, 0], d[:, 1])))
 
 
-def _gmsh_mesh(loops, counts, mesh_size, embed=None):
+def _gmsh_mesh(
+    loops, counts, mesh_size, embed=None, wall_size=None, wall_distance=None
+):
     """Triangulate the region bounded by closed curves with gmsh.
 
     ``loops[0]`` is the outer boundary, further loops are holes; each is a
     closed spline with ``counts[i]`` equally spaced nodes (transfinite). With
     ``embed``, these interior points are fixed mesh nodes and no other
-    interior nodes are inserted. Returns ``(points, triangles,
+    interior nodes are inserted. With ``wall_size``, the triangle size grows
+    linearly from ``wall_size`` at ``loops[0]`` to ``mesh_size`` at the
+    distance ``wall_distance`` from it. Returns ``(points, triangles,
     wall_nodes)``, where ``wall_nodes[i]`` are the nodes on ``loops[i]``.
     """
     import gmsh
@@ -246,6 +250,21 @@ def _gmsh_mesh(loops, counts, mesh_size, embed=None):
         if embed is not None:
             embedded = [geo.addPoint(r, z, 0.0, mesh_size) for r, z in embed]
         geo.synchronize()
+        if wall_size is not None and not embedded:
+            field = gmsh.model.mesh.field
+            dist = field.add("Distance")
+            field.setNumbers(dist, "CurvesList", [curves[0]])
+            field.setNumber(dist, "Sampling", 4 * counts[0])
+            grade = field.add("Threshold")
+            field.setNumber(grade, "InField", dist)
+            field.setNumber(grade, "SizeMin", wall_size)
+            field.setNumber(grade, "SizeMax", mesh_size)
+            field.setNumber(grade, "DistMin", 0.0)
+            field.setNumber(grade, "DistMax", wall_distance)
+            field.setAsBackgroundMesh(grade)
+            gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 0)
+            gmsh.option.setNumber("Mesh.MeshSizeFromPoints", 0)
+            gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
         if embedded:
             gmsh.model.mesh.embed(0, embedded, 2, surface)
             # Only the embedded points: no size-driven node insertion
@@ -371,6 +390,8 @@ class UnstructuredPoloidalGrid:
         relax=False,
         morton=True,
         centroid_dofs=True,
+        wall_size=None,
+        wall_distance=None,
     ):
         """Mesh a disc or annulus with gmsh (Delaunay triangulation).
 
@@ -400,6 +421,11 @@ class UnstructuredPoloidalGrid:
             Place the unknowns at the dual-cell centroids
             (:meth:`use_centroid_dofs`), which gives second-order
             truncation error on the unrelaxed gmsh mesh
+        wall_size, wall_distance : float, optional
+            Graded mesh: node spacing ``wall_size`` on the outer wall, growing
+            linearly to ``mesh_size`` at the distance ``wall_distance`` from it
+            (e.g. to resolve the layer next to a material wall as finely as a
+            flux-aligned structured grid)
 
         The nodes are ordered inner wall, interior, outer wall, and
         ``walls`` is set accordingly. gmsh is imported only here.
@@ -409,11 +435,14 @@ class UnstructuredPoloidalGrid:
         if mesh_size is None:
             raise ValueError("mesh_size is required")
         counts = [n_outer, n_inner][: len(loops)]
+        sizes = [mesh_size if wall_size is None else wall_size, mesh_size]
         counts = [
-            int(np.ceil(_curve_length(c) / mesh_size)) if n is None else int(n)
-            for c, n in zip(loops, counts)
+            int(np.ceil(_curve_length(c) / h)) if n is None else int(n)
+            for c, n, h in zip(loops, counts, sizes)
         ]
-        pts, tri, wall_nodes = _gmsh_mesh(loops, counts, mesh_size)
+        pts, tri, wall_nodes = _gmsh_mesh(
+            loops, counts, mesh_size, wall_size=wall_size, wall_distance=wall_distance
+        )
         if n_nodes is not None and len(pts) != n_nodes:
             if len(pts) > n_nodes:
                 raise ValueError(
@@ -3168,6 +3197,8 @@ def gmsh_planes(
     multiple_of=4,
     centroid_dofs=True,
     dirichlet_walls=True,
+    wall_size=None,
+    wall_distance=None,
 ):
     """Mesh every poloidal cross-section independently with gmsh.
 
@@ -3181,17 +3212,20 @@ def gmsh_planes(
     evolving nodes is a multiple of ``multiple_of``: the non-wall nodes with
     ``dirichlet_walls=True`` (the default; the wall nodes then go into the x
     guard cells), all nodes with ``dirichlet_walls=False``. Pass the same
-    ``dirichlet_walls`` as to :class:`UnstructuredGrid`. ``relax`` and
-    ``centroid_dofs``: see :meth:`UnstructuredPoloidalGrid.from_gmsh`.
+    ``dirichlet_walls`` as to :class:`UnstructuredGrid`. ``relax``,
+    ``centroid_dofs``, ``wall_size`` and ``wall_distance``: see
+    :meth:`UnstructuredPoloidalGrid.from_gmsh`.
     """
     ny = len(outers)
     if inners is None:
         inners = [None] * ny
-    n_outer = int(np.ceil(max(_curve_length(c) for c in outers) / mesh_size))
+    outer_size = mesh_size if wall_size is None else wall_size
+    n_outer = int(np.ceil(max(_curve_length(c) for c in outers) / outer_size))
     n_inner = None
     if inners[0] is not None:
         n_inner = int(np.ceil(max(_curve_length(c) for c in inners) / mesh_size))
     kw = {"mesh_size": mesh_size, "n_outer": n_outer, "n_inner": n_inner}
+    kw.update(wall_size=wall_size, wall_distance=wall_distance)
     kw["centroid_dofs"] = False  # set after relaxing
     planes = [
         UnstructuredPoloidalGrid.from_gmsh(o, i, relax=False, **kw)
