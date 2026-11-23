@@ -1735,6 +1735,7 @@ def dagp_unstructured(
     order=3,
     strict=True,
     processes=1,
+    perp_walls=True,
     **plane_options,
 ):
     """Global CSR matrices for ``FV::Div_a_Grad_perp_FCI_unstructured``.
@@ -1742,6 +1743,8 @@ def dagp_unstructured(
     Only evolving nodes get a divergence row. Face points between two
     Dirichlet wall nodes are dropped; faces between a wall node and an
     evolving node use the wall value, which BOUT++ holds in the guard cell.
+    With ``perp_walls=False`` those faces are dropped too, so that no flux
+    crosses them (insulating walls).
 
     ``processes > 1`` computes the planes in that many worker processes (at
     most ``processes`` planes ahead of the assembly, so that memory stays
@@ -1826,6 +1829,8 @@ def dagp_unstructured(
                 cache.pop(key, None)
 
             keep = interior[b["fi"]] | interior[b["fj"]]
+            if not perp_walls:
+                keep = interior[b["fi"]] & interior[b["fj"]]
             cells = cell_number[grid.node_x, y, 0]
             nfp = int(np.sum(keep))
             rows = offset + np.arange(nfp)
@@ -2969,6 +2974,7 @@ def build_grid_data(
     map_weight_power=3.0,
     map_walls=True,
     near_wall_hits=False,
+    perp_walls=True,
     dagp_extra=16,
     value_order=2,
     processes=1,
@@ -2996,7 +3002,9 @@ def build_grid_data(
     :func:`k2_divergence`); ``near_wall_hits``: see :func:`trace_maps`.
     Without ``near_wall_hits`` the stencils of end points next to a wall
     extrapolate one-sidedly, so use ``map_walls=False`` only together with
-    ``near_wall_hits=True``. ``dagp_extra`` is the number of extra nodes of
+    ``near_wall_hits=True``. ``perp_walls=False`` makes the walls insulating
+    for the perpendicular operator (see :func:`dagp_unstructured`).
+    ``dagp_extra`` is the number of extra nodes of
     the face-gradient fits (16 by default, needed
     on coarse anisotropic meshes; 4 is enough on near-isotropic gmsh meshes)
     and ``value_order`` the order of the separate fit for the face values of
@@ -3033,6 +3041,7 @@ def build_grid_data(
         extra=dagp_extra,
         value_order=value_order,
         processes=processes,
+        perp_walls=perp_walls,
     )
     data = {}
     data.update(slab_metric(grid, field, maps))

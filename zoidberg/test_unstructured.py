@@ -1246,7 +1246,8 @@ def test_same_plane_twice_gives_the_same_grid():
 
 def test_wall_options_keep_wall_nodes_out_of_the_maps():
     # Field lines that cross the walls (constant B_R): map_walls=False keeps
-    # the Dirichlet wall nodes out of the parallel-map stencils, and
+    # the Dirichlet wall nodes out of the parallel-map stencils and the K2
+    # deposits, perp_walls=False makes the walls insulating, and
     # near_wall_hits=True makes end points between the last plasma nodes and
     # the wall hits
     class Tilted(zbfield.Slab):
@@ -1313,7 +1314,7 @@ def test_wall_options_keep_wall_nodes_out_of_the_maps():
         assert in_wall.any() == map_walls
         # The K2 tubes deposit into the wall-node rows only with map_walls
         data, _ = us.build_grid_data(
-            grid, field, map_walls=map_walls, near_wall_hits=True
+            grid, field, map_walls=map_walls, near_wall_hits=True, perp_walls=map_walls
         )
         for name in ("k2_forward", "k2_backward"):
             rows = data[f"{name}_rows"]
@@ -1321,3 +1322,15 @@ def test_wall_options_keep_wall_nodes_out_of_the_maps():
             in_wall = np.zeros(len(weights), dtype=bool)
             in_wall[rows[n_evolving] : rows[n_evolving + n_wall]] = True
             assert np.any(weights[in_wall] != 0) == map_walls
+        # Perpendicular fluxes leave the evolving cells only with perp_walls
+        dV = np.zeros(int(data["total_cells"]))
+        dV[data["cell_number"].ravel()] = data["dagp_us_volume"].ravel()
+        rows = np.repeat(
+            np.arange(len(data["dagp_us_div_rows"]) - 1),
+            np.diff(data["dagp_us_div_rows"]),
+        )
+        out = np.bincount(
+            data["dagp_us_div_columns"],
+            weights=data["dagp_us_div_weights"] * dV[rows],
+        )
+        assert (np.max(np.abs(out)) > 1e-10) == map_walls
