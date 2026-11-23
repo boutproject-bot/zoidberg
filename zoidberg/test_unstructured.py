@@ -1334,3 +1334,15 @@ def test_wall_options_keep_wall_nodes_out_of_the_maps():
             weights=data["dagp_us_div_weights"] * dV[rows],
         )
         assert (np.max(np.abs(out)) > 1e-10) == map_walls
+
+
+def test_field_attributes_in_grid_data():
+    # Attributes of the magnetic field (e.g. psi of a GEQDSK equilibrium) are
+    # written at the unknowns, as for structured grids
+    field = zbfield.Slab(By=1.0, Bz=0.1, Bzprime=0.0)
+    field.attributes = {"psi": lambda R, Z, phi: R**2 + Z + phi}
+    grid = us.UnstructuredGrid(strip(nR=8, nZ=8), np.linspace(0, 1, 4), 4.0)
+    data, _ = us.build_grid_data(grid, field, k2=False)
+    R, Z = data["R"][..., 0], data["Z"][..., 0]
+    y = np.broadcast_to(grid.ycoords, R.shape)
+    np.testing.assert_allclose(data["psi"][..., 0], R**2 + Z + y, rtol=1e-14)

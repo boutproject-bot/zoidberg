@@ -3054,6 +3054,11 @@ def build_grid_data(
     data["R"] = grid.to3d(R)
     data["Z"] = grid.to3d(Z)
     data["Rxy"] = data["R"]
+    # Attributes of the magnetic field (e.g. psi), as for structured grids
+    for name, func in getattr(field, "attributes", {}).items():
+        data[name] = grid.to3d(
+            np.array([func(R[j], Z[j], grid.ycoords[j]) for j in range(grid.ny)])
+        )
     for name in ("forward", "backward"):
         data[f"{name}_R"] = grid.to3d(maps[f"{name}_R"])
         data[f"{name}_Z"] = grid.to3d(maps[f"{name}_Z"])
