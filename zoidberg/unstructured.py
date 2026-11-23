@@ -434,6 +434,8 @@ class UnstructuredPoloidalGrid:
         loops = [outer] if inner is None else [outer, np.asarray(inner, dtype=float)]
         if mesh_size is None:
             raise ValueError("mesh_size is required")
+        if (wall_size is None) != (wall_distance is None):
+            raise ValueError("wall_size and wall_distance must be given together")
         counts = [n_outer, n_inner][: len(loops)]
         sizes = [mesh_size if wall_size is None else wall_size, mesh_size]
         counts = [

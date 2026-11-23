@@ -622,6 +622,10 @@ def test_gmsh_graded_mesh_order():
         )
         w_out = pol.walls[1]
         assert np.isclose(len(w_out), us._curve_length(outer) / (h / 3), rtol=0.01)
+        with pytest.raises(ValueError):
+            us.UnstructuredPoloidalGrid.from_gmsh(
+                outer, inner, mesh_size=h, wall_size=h
+            )
         grid = us.UnstructuredGrid(
             pol, np.array([0.0]), 1.0, dirichlet_walls=True, multiple_of=1
         )
