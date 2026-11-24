@@ -1,3 +1,4 @@
+import itertools
 import warnings
 from pathlib import Path
 
@@ -203,6 +204,63 @@ def test_field_aligned_single_plane_maps(tmp_path, periodic_Z):
             assert np.count_nonzero(ends) == nR
             last = Z.max() if step > 0 else Z.min()
             assert Z[ends] == pytest.approx(last, abs=1e-12)
+
+
+def test_field_aligned_single_plane_maps_sheared(tmp_path):
+    # As above with magnetic shear, Bz(R) = Bz0 + (R - R0) Bzprime: each
+    # closed tube sits where its pitch fits a whole number of nodes per
+    # period, nZ[i] nodes of spacing Lz / nZ[i]. Rows of different spacing
+    # are joined by a strip ("zipper") triangulation. Every map row must be
+    # an exact injection onto the next node of the same tube, and each tube
+    # has its own parallel length
+    Lz, Ly, R0, Bzprime = 1.0, 10.0, 1.0, -0.012
+    nZ = np.arange(8, 16)
+    Bz_tube = Lz / (Ly * nZ)
+    R_tube = R0 + (Bz_tube - Bz_tube[0]) / Bzprime
+    R = np.repeat(R_tube, nZ)
+    Z = np.concatenate([(np.arange(n) + 0.5) * Lz / n for n in nZ])
+    rows = np.split(np.arange(len(R)), np.cumsum(nZ)[:-1])
+
+    def zipper(a, b):
+        # Advance along the row whose next node is lower, around the period
+        m, n = len(a), len(b)
+        tris, j, k = [], 0, 0
+        while j < m or k < n:
+            za = Z[a[(j + 1) % m]] + (Lz if j + 1 >= m else 0.0)
+            zb = Z[b[(k + 1) % n]] + (Lz if k + 1 >= n else 0.0)
+            if k >= n or (j < m and za <= zb):
+                tris.append((a[j % m], b[k % n], a[(j + 1) % m]))
+                j += 1
+            else:
+                tris.append((a[j % m], b[k % n], b[(k + 1) % n]))
+                k += 1
+        return tris
+
+    tris = [t for a, b in itertools.pairwise(rows) for t in zipper(a, b)]
+    pol = us.UnstructuredPoloidalGrid(R, Z, np.array(tris), period_Z=Lz)
+    field = zbfield.Slab(By=1.0, Bz=Bz_tube[0], xcentre=R0, Bzprime=Bzprime)
+    _grid, d, _stats = us.make_unstructured_grid(
+        str(tmp_path / "g.nc"), pol, field, ny=1, Ly=Ly, k2=False
+    )
+    cell = np.asarray(d["cell_number"])[:, 0, 0]
+    Rg, Zg = np.asarray(d["R"])[:, 0, 0], np.asarray(d["Z"])[:, 0, 0]
+    tube = np.argmin(np.abs(Rg[:, None] - R_tube[None, :]), axis=1)
+    node = {int(c): x for x, c in enumerate(cell) if c >= 0}
+    for name, step in (("forward", 1), ("backward", -1)):
+        rows_ = np.asarray(d[f"{name}_rows"])
+        cols = np.asarray(d[f"{name}_columns"])
+        legs = np.asarray(d[f"{name}_leg_interior_number"])[:, 0, 0]
+        assert np.all(np.diff(rows_) == 1)
+        assert np.all(np.asarray(d[f"{name}_weights"]) == 1.0)
+        assert np.count_nonzero(legs >= 0) == len(R)
+        for x in np.flatnonzero(legs >= 0):
+            xt = node[int(cols[rows_[legs[x]]])]
+            assert Rg[xt] == pytest.approx(Rg[x], abs=1e-12)
+            dZ = Zg[xt] - Zg[x] - step * Lz / nZ[tube[x]]
+            assert (dZ + 0.5 * Lz) % Lz - 0.5 * Lz == pytest.approx(0.0, abs=1e-12)
+    dl = (np.asarray(d["dy"]) * np.sqrt(np.asarray(d["g_22"])))[:, 0, 0]
+    expected = Ly * np.sqrt(1.0 + Bz_tube[tube] ** 2)
+    assert dl[cell >= 0] == pytest.approx(expected[cell >= 0], rel=1e-12)
 
 
 def test_dagp_laplacian_quadratic():
