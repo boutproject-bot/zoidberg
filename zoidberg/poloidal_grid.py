@@ -534,6 +534,21 @@ switch inner and outer boundary.
             "g_zz": g[..., 1, 1],
         }
 
+    def orthogonality(self):
+        """Return sin(alpha), the sine of the angle between the coordinate
+        lines, at every grid node (see `sin_alpha`).
+
+        1.0 means locally orthogonal, 0.0 means degenerate/sheared.
+        """
+        return sin_alpha(self.R, self.Z)
+
+    def minSinAlpha(self):
+        """Return the minimum sin(alpha) over all grid cells.
+
+        The minimum cell angle is ``arcsin(minSinAlpha())``.
+        """
+        return sin_alpha(self.R, self.Z).min()
+
 
 def grid_annulus(inner, outer, nx, nz, show=True, return_coords=False):
     """Grid an annular region, given inner and outer boundaries both of
@@ -1519,6 +1534,672 @@ def _densify(eq2, exp, plot=False):
     return theta
 
 
+def sin_alpha(R, Z):
+    """Compute the sine of the angle between the coordinate lines at each
+    grid node, a measure of grid orthogonality.
+
+    For a node with radial derivative ``r_x`` and poloidal derivative
+    ``r_z``,
+
+    .. math:: \\sin\\alpha = \\frac{|r_x \\times r_z|}{|r_x|\\,|r_z|}
+
+    so that ``sin_alpha == 1`` means the grid is locally orthogonal and
+    ``sin_alpha == 0`` means the grid is degenerate/sheared.
+
+    Parameters
+    ----------
+    R, Z : ndarray
+        2D arrays, shape (nx, nz), of R and Z grid point locations.
+        The first dimension is the radial direction (i=0 inner boundary),
+        the second is the poloidal direction (periodic).
+
+    Returns
+    -------
+    ndarray
+        Array of the same shape as R, Z, in the range [0, 1]
+    """
+    R = np.asarray(R)
+    Z = np.asarray(Z)
+
+    dRdx = np.empty_like(R)
+    dZdx = np.empty_like(Z)
+    # Central differences in the interior, one-sided on radial boundaries
+    dRdx[1:-1, :] = (R[2:, :] - R[:-2, :]) / 2
+    dZdx[1:-1, :] = (Z[2:, :] - Z[:-2, :]) / 2
+    dRdx[0, :] = R[1, :] - R[0, :]
+    dZdx[0, :] = Z[1, :] - Z[0, :]
+    dRdx[-1, :] = R[-1, :] - R[-2, :]
+    dZdx[-1, :] = Z[-1, :] - Z[-2, :]
+
+    # Central differences, periodic in the poloidal direction
+    dRdz = (np.roll(R, -1, axis=1) - np.roll(R, 1, axis=1)) / 2
+    dZdz = (np.roll(Z, -1, axis=1) - np.roll(Z, 1, axis=1)) / 2
+
+    cross = dRdx * dZdz - dRdz * dZdx
+    denom = np.sqrt((dRdx**2 + dZdx**2) * (dRdz**2 + dZdz**2))
+    return np.abs(cross) / denom
+
+
+def _signed_jacobian(R, Z):
+    """Signed 2D Jacobian J = dRdx*dZdz - dRdz*dZdx at all grid nodes.
+
+    The sign of J detects folding (handedness change) of the grid. The
+    radial direction uses central differences in the interior and
+    one-sided differences on the radial boundaries; the poloidal
+    direction is periodic.
+    """
+    R = np.asarray(R)
+    Z = np.asarray(Z)
+    dRdx = np.empty_like(R)
+    dZdx = np.empty_like(Z)
+    dRdx[1:-1, :] = R[2:, :] - R[:-2, :]
+    dZdx[1:-1, :] = Z[2:, :] - Z[:-2, :]
+    dRdx[0, :] = R[1, :] - R[0, :]
+    dZdx[0, :] = Z[1, :] - Z[0, :]
+    dRdx[-1, :] = R[-1, :] - R[-2, :]
+    dZdx[-1, :] = Z[-1, :] - Z[-2, :]
+    dRdz = np.roll(R, -1, axis=1) - np.roll(R, 1, axis=1)
+    dZdz = np.roll(Z, -1, axis=1) - np.roll(Z, 1, axis=1)
+    return dRdx * dZdz - dRdz * dZdx
+
+
+def _folded(R, Z, refR, refZ):
+    """True if the grid R, Z has flipped handedness relative to refR, refZ"""
+    sign_new = np.sign(_signed_jacobian(R, Z)).ravel()
+    sign_ref = np.sign(_signed_jacobian(refR, refZ)).ravel()
+    return not np.all(sign_new == sign_ref)
+
+
+def _boundary_normals(R, Z, side):
+    """Unit boundary normal pointing into the domain, at every point of a
+    radial boundary ring (``side=0`` inner, ``side=-1`` outer).
+
+    The normal is perpendicular to the boundary tangent computed with
+    periodic central differences in the poloidal direction. The orientation
+    is chosen so that the normal has positive dot product with the vector
+    from the boundary to the nearest interior ring.
+    """
+    if side == 0:
+        r, z = R[0], Z[0]
+        toward_r, toward_z = R[1], Z[1]
+    else:
+        r, z = R[-1], Z[-1]
+        toward_r, toward_z = R[-2], Z[-2]
+    dR = (np.roll(r, -1) - np.roll(r, 1)) / 2
+    dZ = (np.roll(z, -1) - np.roll(z, 1)) / 2
+    nR, nZ = dZ, -dR
+    if np.sum(nR * (toward_r - r) + nZ * (toward_z - z)) < 0:
+        nR, nZ = -nR, -nZ
+    nrm = np.sqrt(nR**2 + nZ**2)
+    return nR / nrm, nZ / nrm
+
+
+def _rotate_rings(R, Z, layers, wfunc):
+    """Rotate the first ``layers`` rings from each radial boundary toward
+    the local boundary normals, preserving the node-to-boundary distance
+    ``|d|`` of every node (no stretching, no poloidal smoothing).
+
+    Ring ``i`` is moved along the great-circle-like interpolation between
+    its current direction ``d/|d|`` and the boundary normal ``n`` with
+    weight ``w = wfunc(i)``, so ``w=1`` puts the ring exactly on the
+    normal. Boundary rings (i=0 and i=nx-1) are never modified.
+    """
+    R = np.array(R, copy=True)
+    Z = np.array(Z, copy=True)
+    nx, nz = R.shape
+    if layers < 1 or nx < layers + 2:
+        return R, Z
+    layers = min(layers, nx - 2)
+    for side in (0, -1):
+        nR, nZ = _boundary_normals(R, Z, side)
+        if side == 0:
+            bR, bZ = R[0].copy(), Z[0].copy()
+        else:
+            bR, bZ = R[-1].copy(), Z[-1].copy()
+        for i in range(1, layers + 1):
+            w = wfunc(i)
+            if w <= 0:
+                continue
+            j = i if side == 0 else nx - 1 - i
+            dX = R[j] - bR
+            dZ = Z[j] - bZ
+            nrm = np.hypot(dX, dZ)
+            nrm = np.where(nrm < 1e-14, 1.0, nrm)
+            dHX, dHZ = dX / nrm, dZ / nrm
+            mx = (1 - w) * dHX + w * nR
+            mz = (1 - w) * dHZ + w * nZ
+            mn = np.hypot(mx, mz)
+            R[j] = bR + nrm * mx / mn
+            Z[j] = bZ + nrm * mz / mn
+    return R, Z
+
+
+def _laplace_relax(R, Z, dz_relax, n_sweeps, fixed=None):
+    """Jacobi relaxation of the plain elliptic grid equations keeping the
+    boundary rings (and any rings in ``fixed``) pinned.
+
+    Solves ``a*r_xx - 2*b*r_xz + c*r_zz = 0`` for the free rings, where
+    ``a = |r_z|^2``, ``b = r_x.r_z``, ``c = |r_x|^2``, with the same
+    ``dz_relax`` poloidal scaling as `grid_elliptic`'s solver. Influence
+    from the fixed rings decays into the interior after a few tens of
+    sweeps.
+    """
+    R = np.array(R, copy=True)
+    Z = np.array(Z, copy=True)
+    nx, nz = R.shape
+    fixedmask = np.zeros((nx, nz), dtype=bool)
+    fixedmask[0, :] = True
+    fixedmask[-1, :] = True
+    if fixed is not None:
+        for j in fixed:
+            fixedmask[j, :] = True
+    for _ in range(n_sweeps):
+        R_xm = R[:-2, :]
+        R_xp = R[2:, :]
+        R_zm = np.roll(R, 1, axis=1)
+        R_zp = np.roll(R, -1, axis=1)
+        R_xmzm = R_zm[:-2, :]
+        R_xpzm = R_zm[2:, :]
+        R_xmzp = R_zp[:-2, :]
+        R_xpzp = R_zp[2:, :]
+        R_zm = R_zm[1:-1, :]
+        R_zp = R_zp[1:-1, :]
+        Z_xm = Z[:-2, :]
+        Z_xp = Z[2:, :]
+        Z_zm = np.roll(Z, 1, axis=1)
+        Z_zp = np.roll(Z, -1, axis=1)
+        Z_xmzm = Z_zm[:-2, :]
+        Z_xpzm = Z_zm[2:, :]
+        Z_xmzp = Z_zp[:-2, :]
+        Z_xpzp = Z_zp[2:, :]
+        Z_zm = Z_zm[1:-1, :]
+        Z_zp = Z_zp[1:-1, :]
+        dRdx = (R_xp - R_xm) / 2
+        dZdx = (Z_xp - Z_xm) / 2
+        dRdz = dz_relax * (R_zp - R_zm) / 2
+        dZdz = dz_relax * (Z_zp - Z_zm) / 2
+        a = dRdz**2 + dZdz**2
+        b = dRdz * dRdx + dZdx * dZdz
+        c = dRdx**2 + dZdx**2
+        cross_R = R_xpzp - R_xmzp - R_xpzm + R_xmzm
+        cross_Z = Z_xpzp - Z_xmzp - Z_xpzm + Z_xmzm
+        denom = 2 * (a + c)
+        denom_safe = np.where(np.abs(denom) < 1e-14, 1.0, denom)
+        new_R = (
+            a * (R_xm + R_xp) + c * (R_zm + R_zp) - b * cross_R / 2
+        ) / denom_safe
+        new_Z = (
+            a * (Z_xm + Z_xp) + c * (Z_zm + Z_zp) - b * cross_Z / 2
+        ) / denom_safe
+        free = ~fixedmask[1:-1, :]
+        R[1:-1, :] = np.where(free, new_R, R[1:-1, :])
+        Z[1:-1, :] = np.where(free, new_Z, Z[1:-1, :])
+    return R, Z
+
+
+def _orthogonalize_boundary(
+    R,
+    Z,
+    layers=3,
+    n_relax=40,
+    passes=1,
+    dz_relax=10.0 / 3.0,
+):
+    """Algebraic near-boundary orthogonalization (Dirichlet-Neumann style).
+
+    For each radial boundary ring (inner i=0 and outer i=nx-1) the first
+    ``layers`` interior rings are rotated so that their radial segments
+    point along the local boundary normal, preserving the distance to the
+    boundary of every node (see `_rotate_rings`). The rotated rings are
+    then pinned and the interior is relaxed with `_laplace_relax` so the
+    correction decays smoothly into the grid instead of creating kinks.
+    The boundary grid points themselves are never modified.
+
+    This trades a little global cell orthogonality near the layer edge for
+    a strongly orthogonal boundary; the GRAPE-style control-function
+    iteration (`_grid_elliptic_control`) is preferred when a global lower
+    bound on ``sin(alpha)`` is required.
+
+    Parameters
+    ----------
+    R, Z : ndarray
+        2D arrays, shape (nx, nz), i=0 the inner boundary, i=nx-1 the
+        outer boundary, the poloidal direction is periodic.
+    layers : int, optional
+        Number of rings away from each radial boundary to rotate.
+    n_relax : int, optional
+        Number of Laplace-relaxation sweeps used to smooth the correction.
+    passes : int, optional
+        Number of rotate-then-relax passes.
+    dz_relax : float, optional
+        Extra poloidal scaling of the metric coefficients.
+
+    Returns
+    -------
+    R, Z : (ndarray, ndarray)
+        Corrected grids
+    """
+    R = np.array(R, copy=True)
+    Z = np.array(Z, copy=True)
+    nx, nz = R.shape
+    if nx < 5 or layers < 1:
+        return R, Z
+    layers = min(layers, (nx - 2) // 2)
+    baseR = R.copy()
+    baseZ = Z.copy()
+    wfunc = lambda i: (layers + 1 - i) / (layers + 1)
+    for _ in range(passes):
+        R, Z = _rotate_rings(R, Z, layers, wfunc)
+        pinned = list(range(1, layers + 1)) + list(
+            range(nx - 1 - layers, nx - 1)
+        )
+        Rw, Zw = _laplace_relax(R, Z, dz_relax, n_relax, fixed=pinned)
+        if _folded(Rw, Zw, baseR, baseZ):
+            # The pass would fold the grid: linearly retreat from the
+            # input until it no longer folds.
+            for fac in (0.5, 0.25, 0.125):
+                Rt = R + fac * (Rw - R)
+                Zt = Z + fac * (Zw - Z)
+                if not _folded(Rt, Zt, baseR, baseZ):
+                    Rw, Zw = Rt, Zt
+                    break
+            else:
+                break
+        R, Z = Rw, Zw
+    return R, Z
+
+
+def _boundary_control_functions(R, Z, dz_relax=10.0 / 3.0, cap=None):
+    """GRAPE/Sorenson-style target control functions on the radial
+    boundaries.
+
+    The control functions P, Q in the elliptic grid generation equation
+
+    .. math::
+
+        \\alpha\\,r_{xx} - 2\\beta\\,r_{xz} + \\gamma\\,r_{zz}
+        + J^2 (P\\,r_x + Q\\,r_z) = 0
+
+    are backed out at every boundary point from the PDE with the *target*
+    boundary derivative ``r_x = n ds`` (the boundary normal times the
+    current first-ring spacing).  Using the normal makes the local
+    2x2 system well conditioned even where the current grid is nearly
+    degenerate (the direct inversion against the current ``r_x`` blows up
+    like ``1/J^3``). The boundary ``r_xx`` uses the one-sided four-point
+    formula of GRAPE with the prescribed first derivative:
+
+    .. math:: r_{xx}(0) = \\frac12(-7 r_0 + 8 r_1 - r_2) - 3 r_{x,spec}
+
+    which is computed from the boundary and the two nearest interior rings.
+
+    Parameters
+    ----------
+    R, Z : ndarray
+        2D arrays, shape (nx, nz). i=0 is the inner boundary, i=nx-1 the
+        outer boundary, the poloidal direction is periodic.
+    dz_relax : float, optional
+        Extra poloidal scaling of the metric coefficients, consistent with
+        `grid_elliptic`'s solver.
+    cap : float, optional
+        If given, clip P and Q to +/- cap.
+
+    Returns
+    -------
+    P_inner, Q_inner, P_outer, Q_outer : (ndarray, ndarray, ndarray, ndarray)
+        Target control functions (each length nz) on the inner and outer
+        boundaries.  P multiplies the radial derivative ``r_x`` and Q the
+        poloidal derivative ``r_z``.
+    """
+    R = np.asarray(R)
+    Z = np.asarray(Z)
+    nx, nz = R.shape
+    if nx < 4:
+        return 0 * R[0], 0 * R[0], 0 * R[0], 0 * R[0]
+
+    def side_data(side):
+        b = 0 if side == 0 else nx - 1
+        j1 = 1 if side == 0 else nx - 2
+        j2 = 2 if side == 0 else nx - 3
+        # Poloidal derivatives on the boundary ring
+        rz_R = dz_relax * (np.roll(R[b], -1) - np.roll(R[b], 1)) / 2
+        rz_Z = dz_relax * (np.roll(Z[b], -1) - np.roll(Z[b], 1)) / 2
+        rzz_R = dz_relax**2 * (np.roll(R[b], 1) - 2 * R[b] + np.roll(R[b], -1))
+        rzz_Z = dz_relax**2 * (np.roll(Z[b], 1) - 2 * Z[b] + np.roll(Z[b], -1))
+        # Prescribed radial derivative: boundary normal * current spacing
+        nR, nZ = _boundary_normals(R, Z, side)
+        ds = np.hypot(R[j1] - R[b], Z[j1] - Z[b])
+        rb_R, rb_Z = nR * ds, nZ * ds
+        # One-sided radial second derivative at the boundary (GRAPE F0..F5)
+        rxx_R = 0.5 * (-7 * R[b] + 8 * R[j1] - R[j2]) - 3 * rb_R
+        rxx_Z = 0.5 * (-7 * Z[b] + 8 * Z[j1] - Z[j2]) - 3 * rb_Z
+        # Mixed derivative of the prescribed derivative in the poloidal dir
+        rxr = (np.roll(rb_R, -1) - np.roll(rb_R, 1)) / 2
+        rxz = (np.roll(rb_Z, -1) - np.roll(rb_Z, 1)) / 2
+        a = rz_R**2 + rz_Z**2
+        bm = rb_R * rz_R + rb_Z * rz_Z
+        c = rb_R**2 + rb_Z**2
+        J = rb_R * rz_Z - rb_Z * rz_R
+        # J is the Jacobian of the *prescribed* (normal) boundary geometry,
+        # so it is bounded from below away from exact tangency.
+        rhs_R = -(a * rxx_R - 2 * bm * rxr + c * rzz_R) / J**2
+        rhs_Z = -(a * rxx_Z - 2 * bm * rxz + c * rzz_Z) / J**2
+        Jsafe = np.where(np.abs(J) < 1e-14, 1.0, J)
+        P = (rz_Z * rhs_R - rz_R * rhs_Z) / Jsafe
+        Q = (-rb_Z * rhs_R + rb_R * rhs_Z) / Jsafe
+        P = np.where(np.abs(J) < 1e-12, 0.0, P)
+        Q = np.where(np.abs(J) < 1e-12, 0.0, Q)
+        if cap is not None:
+            P = np.clip(P, -cap, cap)
+            Q = np.clip(Q, -cap, cap)
+        return P, Q
+
+    P_in, Q_in = side_data(0)
+    P_out, Q_out = side_data(-1)
+    return P_in, Q_in, P_out, Q_out
+
+
+def _blend_control_functions(P_in, Q_in, P_out, Q_out, nx, decay=2.0):
+    """Exponentially blend boundary control functions into the interior.
+
+    The control functions take their (nonzero) boundary values on the
+    inner and outer boundaries and decay exponentially into the domain,
+    so their influence is strongest near the boundaries.
+    """
+    x = np.linspace(0, 1, nx)
+    w_in = np.exp(-decay * x)
+    w_out = np.exp(-decay * (1 - x))
+    W = w_in + w_out
+    P = (w_in[:, None] * P_in[None, :] + w_out[:, None] * P_out[None, :]) / W[:, None]
+    Q = (w_in[:, None] * Q_in[None, :] + w_out[:, None] * Q_out[None, :]) / W[:, None]
+    P[0, :] = P_in
+    P[-1, :] = P_out
+    Q[0, :] = Q_in
+    Q[-1, :] = Q_out
+    return P, Q
+
+
+def _grid_elliptic_control(
+    R,
+    Z,
+    dz_relax=10.0 / 3.0,
+    max_outer=7,
+    inner_sweeps=25,
+    omega=0.6,
+    decay=2.0,
+    OMEGP=0.3,
+    PLIM=1.0,
+    max_move=None,
+    cap=None,
+):
+    """GRAPE/Sorenson-style control-function iteration on the elliptic PDE.
+
+    Each outer iteration the target boundary control functions
+    (P on ``r_x``, Q on ``r_z``) are recomputed from the current grid by
+    `_boundary_control_functions` and the working boundary control
+    functions are advanced toward them with the *limited* correction of
+    GRAPE (Sorenson), which caps each increment by
+    ``min(OMEGP*|resid|, PLIM*max(|P_old|, 1))``. The limited control
+    functions are blended exponentially into the interior and a short run
+    of under-relaxed Jacobi sweeps of
+
+    .. math::
+
+        \\alpha\\,r_{xx} - 2\\beta\\,r_{xz} + \\gamma\\,r_{zz}
+        + J^2 (P\\,r_x + Q\\,r_z) = 0
+
+    is solved with the boundary rings fixed. Each outer iteration starts
+    from the best grid seen so far (by minimum ``sin_alpha``) so that the
+    iteration monotonically improves the global floor and never returns a
+    grid worse than its input.
+
+    Parameters
+    ----------
+    R, Z : ndarray
+        2D arrays, shape (nx, nz)
+    dz_relax : float, optional
+        Extra poloidal scaling of the metric coefficients
+    max_outer : int, optional
+        Number of control-function recomputation iterations
+    inner_sweeps : int, optional
+        Jacobi sweeps per outer iteration
+    omega : float, optional
+        Under-relaxation factor for the Jacobi sweeps (plain Jacobi would
+        be ``1.0``)
+    decay : float, optional
+        Exponential decay rate used when blending control functions into
+        the interior (larger = more local to the boundaries)
+    OMEGP, PLIM : float, optional
+        GRAPE limited-update coefficients (see module docstring)
+    max_move : float, optional
+        Maximum nodal displacement allowed per Jacobi sweep; default is a
+        small fraction of the median cell size
+    cap : float, optional
+        If given, clip the boundary control functions to +/- cap
+
+    Returns
+    -------
+    R, Z : (ndarray, ndarray)
+        Corrected grids
+    """
+    R = np.array(R, copy=True)
+    Z = np.array(Z, copy=True)
+    nx, nz = R.shape
+    if nx < 4:
+        return R, Z
+    if max_move is None:
+        max_move = 0.02 * np.median(
+            np.hypot(R[1:] - R[:-1], Z[1:] - Z[:-1])
+        )
+
+    baseR = R.copy()
+    baseZ = Z.copy()
+    best_s = sin_alpha(R, Z).min()
+    best_R, best_Z = R.copy(), Z.copy()
+
+    P_in = Q_in = P_out = Q_out = np.zeros(nz)
+    for _ in range(max_outer):
+        tP_in, tQ_in, tP_out, tQ_out = _boundary_control_functions(
+            R, Z, dz_relax, cap=cap
+        )
+        P_in = _limited_control_step(P_in, tP_in, OMEGP, PLIM)
+        Q_in = _limited_control_step(Q_in, tQ_in, OMEGP, PLIM)
+        P_out = _limited_control_step(P_out, tP_out, OMEGP, PLIM)
+        Q_out = _limited_control_step(Q_out, tQ_out, OMEGP, PLIM)
+        P, Q = _blend_control_functions(P_in, Q_in, P_out, Q_out, nx, decay=decay)
+
+        omega_eff = omega
+        for _ in range(inner_sweeps):
+            R_xm = R[:-2, :]
+            R_xp = R[2:, :]
+            R_zm = np.roll(R, 1, axis=1)
+            R_zp = np.roll(R, -1, axis=1)
+            R_xmzm = R_zm[:-2, :]
+            R_xpzm = R_zm[2:, :]
+            R_xmzp = R_zp[:-2, :]
+            R_xpzp = R_zp[2:, :]
+            R_zm = R_zm[1:-1, :]
+            R_zp = R_zp[1:-1, :]
+            Z_xm = Z[:-2, :]
+            Z_xp = Z[2:, :]
+            Z_zm = np.roll(Z, 1, axis=1)
+            Z_zp = np.roll(Z, -1, axis=1)
+            Z_xmzm = Z_zm[:-2, :]
+            Z_xpzm = Z_zm[2:, :]
+            Z_xmzp = Z_zp[:-2, :]
+            Z_xpzp = Z_zp[2:, :]
+            Z_zm = Z_zm[1:-1, :]
+            Z_zp = Z_zp[1:-1, :]
+            dRdx = (R_xp - R_xm) / 2
+            dZdx = (Z_xp - Z_xm) / 2
+            dRdz = dz_relax * (R_zp - R_zm) / 2
+            dZdz = dz_relax * (Z_zp - Z_zm) / 2
+            a = dRdz**2 + dZdz**2
+            b = dRdz * dRdx + dZdx * dZdz
+            c = dRdx**2 + dZdx**2
+            J = dRdx * dZdz - dRdz * dZdx
+            srcR = J**2 * (P[1:-1, :] * dRdx + Q[1:-1, :] * dRdz)
+            srcZ = J**2 * (P[1:-1, :] * dZdx + Q[1:-1, :] * dZdz)
+            cross_R = R_xpzp - R_xmzp - R_xpzm + R_xmzm
+            cross_Z = Z_xpzp - Z_xmzp - Z_xpzm + Z_xmzm
+            denom = 2 * (a + c)
+            denom_safe = np.where(np.abs(denom) < 1e-14, 1.0, denom)
+            new_R = (
+                a * (R_xm + R_xp)
+                + c * (R_zm + R_zp)
+                - b * cross_R / 2
+                + srcR
+            ) / denom_safe
+            new_Z = (
+                a * (Z_xm + Z_xp)
+                + c * (Z_zm + Z_zp)
+                - b * cross_Z / 2
+                + srcZ
+            ) / denom_safe
+            upd_R = omega * (new_R - R[1:-1, :])
+            upd_Z = omega * (new_Z - Z[1:-1, :])
+            # Cap the per-sweep displacement
+            mag = np.hypot(upd_R, upd_Z)
+            scale = np.minimum(1.0, max_move / np.maximum(mag, 1e-30))
+            upd_R *= scale
+            upd_Z *= scale
+            R_try = R.copy()
+            Z_try = Z.copy()
+            R_try[1:-1, :] += upd_R
+            Z_try[1:-1, :] += upd_Z
+            if np.any(
+                np.sign(_signed_jacobian(R_try, Z_try))
+                != np.sign(_signed_jacobian(baseR, baseZ))
+            ):
+                # The update would fold the grid: try half step, else skip.
+                R_try = R.copy()
+                Z_try = Z.copy()
+                R_try[1:-1, :] += 0.5 * upd_R
+                Z_try[1:-1, :] += 0.5 * upd_Z
+                if np.any(
+                    np.sign(_signed_jacobian(R_try, Z_try))
+                    != np.sign(_signed_jacobian(baseR, baseZ))
+                ):
+                    break
+                omega_eff = max(0.2, omega_eff * 0.5)
+            R, Z = R_try, Z_try
+
+        s = sin_alpha(R, Z).min()
+        if s > best_s:
+            best_s, best_R, best_Z = s, R.copy(), Z.copy()
+
+    return best_R, best_Z
+
+
+def _limited_control_step(old, target, OMEGP, PLIM):
+    """GRAPE-style limited update of a boundary control function array.
+
+    Advances ``old`` toward ``target`` by at most
+    ``min(OMEGP*|resid|, PLIM*max(|old|, 1))``, preventing the control
+    functions from jumping violently in the first iterations.
+    """
+    resid = target - old
+    jump = PLIM * np.maximum(np.abs(old), 1.0)
+    corr = np.sign(resid) * np.minimum(OMEGP * np.abs(resid), jump)
+    return old + corr
+
+
+def _enforce_boundary_orthogonality(
+    R,
+    Z,
+    control_functions=False,
+    min_sin_alpha=None,
+    layers=2,
+    dz_relax=10.0 / 3.0,
+    max_attempts=6,
+):
+    """Apply boundary-orthogonality corrections to a grid.
+
+    Correction is either the GRAPE/Sorenson-style control-function
+    iteration on the elliptic PDE (``control_functions=True``), or the
+    simpler algebraic Dirichlet-Neumann near-boundary correction
+    (otherwise).  Both keep the boundary grid points fixed on the inner
+    and outer boundaries.
+
+    If ``min_sin_alpha`` is given the correction is applied repeatedly
+    with increasing strength until the minimum ``sin_alpha`` over all
+    cells reaches the requested value. If that cannot be achieved a
+    warning is issued and the best grid found is returned.
+
+    Parameters
+    ----------
+    R, Z : ndarray
+        2D arrays, shape (nx, nz)
+    control_functions : bool, optional
+        If True, use the control-function (GRAPE-style) iteration,
+        otherwise use the algebraic near-boundary correction
+    min_sin_alpha : float, optional
+        If given, attempt to ensure all cells satisfy
+        ``sin_alpha >= min_sin_alpha``
+    layers : int, optional
+        Number of near-boundary rings corrected by the algebraic method
+    dz_relax : float, optional
+        Extra poloidal scaling used by the methods
+    max_attempts : int, optional
+        Maximum number of times the correction is strengthened
+
+    Returns
+    -------
+    R, Z : (ndarray, ndarray)
+        Corrected grids
+    """
+    R = np.array(R, copy=True)
+    Z = np.array(Z, copy=True)
+    nx = R.shape[0]
+
+    def apply_correction(R, Z, strength):
+        if control_functions:
+            R1, Z1 = _grid_elliptic_control(
+                R,
+                Z,
+                dz_relax=dz_relax,
+                max_outer=7 + 3 * strength,
+                cap=None,
+            )
+        else:
+            nlay = min(layers + strength, (nx - 1) // 2)
+            R1, Z1 = _orthogonalize_boundary(
+                R,
+                Z,
+                layers=nlay,
+                n_relax=80 + 20 * strength,
+                passes=1 + strength // 2,
+                dz_relax=dz_relax,
+            )
+        return R1, Z1
+
+    if min_sin_alpha is None:
+        return apply_correction(R, Z, 0)
+
+    # Best grid so far (initially the uncorrected one)
+    best_s = sin_alpha(R, Z).min()
+    best_R, best_Z = R.copy(), Z.copy()
+    if best_s >= min_sin_alpha:
+        return R, Z
+
+    for strength in range(max_attempts):
+        Rc, Zc = apply_correction(R, Z, strength)
+        s = sin_alpha(Rc, Zc).min()
+        if s > best_s:
+            best_R, best_Z, best_s = Rc.copy(), Zc.copy(), s
+        if best_s >= min_sin_alpha:
+            break
+    else:
+        warnings.warn(
+            f"Could not achieve min_sin_alpha={min_sin_alpha}: "
+            f"best value found was {best_s:.6f}. "
+            "Returning the grid with the best orthogonality found.",
+            stacklevel=2,
+        )
+
+    return best_R, best_Z
+
+
+
 def grid_elliptic(
     inner,
     outer,
@@ -1539,6 +2220,10 @@ def grid_elliptic(
     dz_relax=None,
     guess=None,
     densify_outer=None,
+    boundary_orthogonal=False,
+    control_functions=False,
+    min_sin_alpha=None,
+    orthogonal_layers=2,
 ):
     """Create a structured grid between inner and outer boundaries using
      elliptic method
@@ -1605,17 +2290,42 @@ def grid_elliptic(
      return_coords : bool, optional
          If True, return the R, Z coordinates of the grid points,
          instead of a `StructuredPoloidalGrid`
-
+     boundary_orthogonal : bool, optional
+         If True, apply a near-boundary orthogonality correction so that
+         the grid lines cross the inner and outer radial boundaries
+         orthogonally.
+     control_functions : bool, optional
+         If True, apply a GRAPE/Sorenson-style control-function iteration
+         on the elliptic grid equations instead of the algebraic
+         near-boundary correction. This also implies the boundary is made
+         orthogonal to the grid lines.
+     min_sin_alpha : float, optional
+         If given, the correction is strengthened (up to an internal
+         limit) until every cell satisfies ``sin_alpha >= min_sin_alpha``.
+         ``sin_alpha`` is the sine of the angle between the coordinate
+         lines: 1.0 means locally orthogonal, 0.0 means degenerate.  A
+         warning is issued if the value cannot be reached, in which case
+         the grid with the best orthogonality found is returned. If given
+         without ``boundary_orthogonal`` or ``control_functions``, the
+         GRAPE-style control-function correction is enabled
+         automatically.
+     orthogonal_layers : int, optional
+         Number of rings next to each radial boundary which are used in
+         the algebraic near-boundary correction.
+ 
      Returns
      -------
      If return_coords is true, returns R,Z as arrays.
      If return_coords is false, returns a `StructuredPoloidalGrid` object
-
+ 
      References
      ----------
      https://web.archive.org/web/20040530002835/https://www.nada.kth.se/kurser/kth/2D1263/l2.pdf
      https://en.wikipedia.org/wiki/Principles_of_grid_generation
-
+     https://www.pdas.com/gridgen.html (GRAPE, Grid About Airfoils Using
+     Poisson's Equation; the control-function iteration implemented here
+     follows Sorenson's procedure).
+ 
     """
     if nx_outer:
         assert nx_outer > 0
@@ -2373,6 +3083,22 @@ def grid_elliptic(
     R, Z = solve_equation(
         R, Z, dz_relax, xvals[1] - xvals[0], thetavals[1] - thetavals[0]
     )
+
+    # Boundary-orthogonality corrections
+    if min_sin_alpha is not None and not (boundary_orthogonal or control_functions):
+        # min_sin_alpha needs a correction mechanism to enforce it; the
+        # GRAPE-style control-function iteration is the one that raises
+        # the global floor of sin_alpha.
+        control_functions = True
+    if boundary_orthogonal or control_functions:
+        R, Z = _enforce_boundary_orthogonality(
+            R,
+            Z,
+            control_functions=control_functions,
+            min_sin_alpha=min_sin_alpha,
+            layers=orthogonal_layers,
+            dz_relax=dz_relax or 10 / 3,
+        )
 
     if nx_outer:
         dn = np.arange(nx_outer) + 1
