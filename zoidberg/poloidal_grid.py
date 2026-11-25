@@ -1577,7 +1577,11 @@ def sin_alpha(R, Z):
 
     cross = dRdx * dZdz - dRdz * dZdx
     denom = np.sqrt((dRdx**2 + dZdx**2) * (dRdz**2 + dZdz**2))
-    return np.abs(cross) / denom
+    # Guard against zero-length segments (coincident nodes): the cell is
+    # degenerate there, so sin(alpha) = 0.
+    out = np.zeros_like(R, dtype=float)
+    np.divide(np.abs(cross), denom, out=out, where=denom > 0)
+    return out
 
 
 def _signed_jacobian(R, Z):
@@ -1646,7 +1650,7 @@ def _rotate_rings(R, Z, layers, wfunc):
     """
     R = np.array(R, copy=True)
     Z = np.array(Z, copy=True)
-    nx, nz = R.shape
+    nx = R.shape[0]
     if layers < 1 or nx < layers + 2:
         return R, Z
     layers = min(layers, nx - 2)
@@ -1669,6 +1673,7 @@ def _rotate_rings(R, Z, layers, wfunc):
             mx = (1 - w) * dHX + w * nR
             mz = (1 - w) * dHZ + w * nZ
             mn = np.hypot(mx, mz)
+            mn = np.where(mn < 1e-14, 1.0, mn)
             R[j] = bR + nrm * mx / mn
             Z[j] = bZ + nrm * mz / mn
     return R, Z
@@ -1781,7 +1786,7 @@ def _orthogonalize_boundary(
     """
     R = np.array(R, copy=True)
     Z = np.array(Z, copy=True)
-    nx, nz = R.shape
+    nx = R.shape[0]
     if nx < 5 or layers < 1:
         return R, Z
     layers = min(layers, (nx - 2) // 2)
@@ -1852,7 +1857,7 @@ def _boundary_control_functions(R, Z, dz_relax=10.0 / 3.0, cap=None):
     """
     R = np.asarray(R)
     Z = np.asarray(Z)
-    nx, nz = R.shape
+    nx = R.shape[0]
     if nx < 4:
         return 0 * R[0], 0 * R[0], 0 * R[0], 0 * R[0]
 
@@ -2055,8 +2060,8 @@ def _grid_elliptic_control(
                 - b * cross_Z / 2
                 + srcZ
             ) / denom_safe
-            upd_R = omega * (new_R - R[1:-1, :])
-            upd_Z = omega * (new_Z - Z[1:-1, :])
+            upd_R = omega_eff * (new_R - R[1:-1, :])
+            upd_Z = omega_eff * (new_Z - Z[1:-1, :])
             # Cap the per-sweep displacement
             mag = np.hypot(upd_R, upd_Z)
             scale = np.minimum(1.0, max_move / np.maximum(mag, 1e-30))
