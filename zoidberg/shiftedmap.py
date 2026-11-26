@@ -24,6 +24,12 @@ Grid variables written, for ``<dir>`` in ``forward`` and ``backward``:
 ``<dir>_<component>``
     The metric at the neighbour (the cell's own at a target), for the
     components BOUT++ reads in the parallel slices with 3D metrics.
+``g_22_cell_ylow``, ``g_22_cell_yhigh``, ``By``, ``By_cell_ylow``, ``By_cell_yhigh``
+    The y faces, which BOUT++ reads from the grid on FCI-like meshes: g_22
+    there, and By at the cell (``By``, or ``Bxy``) and at the faces, chosen
+    so that the face areas are those of the field-aligned mesh (the mean of
+    J / sqrt(g_22) dx dz of the two cells). Written if the grid has ``J``
+    and ``g_22``.
 
 Every other 2D (x, y) variable is written for each cell; ``d2x`` is zero
 (index x has no meaning in the new grid) and so is ``d2y`` unless the
@@ -146,7 +152,13 @@ def recast(source, target, mxg=2, seed=None):
     # Without x guard cells BOUT++ cannot difference dx or dy itself
     values["d2x"] = np.zeros((ncells, 1))
     values.setdefault("d2y", np.zeros((ncells, 1)))
-    for name, step in (("forward", 1), ("backward", -1)):
+    faces = "J" in cell_values and "g_22" in cell_values
+    if faces:
+        g_22 = cell_values["g_22"]
+        jxz = cell_values["J"] / np.sqrt(g_22)
+        by = cell_values.get("By", cell_values.get("Bxy", np.ones(g_22.shape)))
+        values["By"] = by[xs, ys][:, None]
+    for name, step, face in (("forward", 1, "yhigh"), ("backward", -1, "ylow")):
         neighbour, dzeta = single_null_neighbours(topology, zshift, shift_angle, step)
         neighbour, dzeta = neighbour[xs, ys], dzeta[xs, ys]
         at_target = neighbour < 0
@@ -154,13 +166,23 @@ def recast(source, target, mxg=2, seed=None):
         values[f"pmap_{name}_x"] = np.where(at_target, ncells, other)[:, None]
         values[f"pmap_{name}_y"] = np.zeros((ncells, 1))
         values[f"pmap_{name}_dzeta"] = dzeta[:, None]
+        # y of the neighbour, the cell's own at a target
+        there = np.where(at_target, ys, neighbour)
         for component in SLICED:
             if component in cell_values:
-                field = cell_values[component]
-                there = field[xs, np.maximum(neighbour, 0)]
-                values[f"{name}_{component}"] = np.where(
-                    at_target, field[xs, ys], there
-                )[:, None]
+                values[f"{name}_{component}"] = cell_values[component][xs, there][
+                    :, None
+                ]
+        if faces:
+            # The y faces as BOUT++ takes them on a field-aligned mesh: g_22
+            # from the mean of sqrt(g_22), and the area J / sqrt(g_22) dx dz
+            # averaged over the two cells. On FCI-like meshes BOUT++ reads
+            # g_22 at the faces and takes the areas from By at the cell and
+            # the face, so By at the face gives the same areas
+            root = 0.5 * (np.sqrt(g_22[xs, ys]) + np.sqrt(g_22[xs, there]))
+            values[f"g_22_cell_{face}"] = (root**2)[:, None]
+            mean = 0.5 * (jxz[xs, ys] + jxz[xs, there])
+            values[f"By_cell_{face}"] = (by[xs, ys] * jxz[xs, ys] / mean)[:, None]
 
     with Dataset(target, "w") as d:
         d.createDimension("x", ncells)

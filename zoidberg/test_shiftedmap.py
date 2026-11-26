@@ -23,6 +23,7 @@ def write_single_null(path, jyseps2_1=6, jyseps1_2=6):
         "dy": 0.5 + 0.02 * y,
         "g_22": 1 + 0.1 * x + 0.01 * y,
         "g22": 1 / (1 + 0.1 * x + 0.01 * y),
+        "J": 1 + 0.05 * x + 0.02 * y**2,
         "Bxy": 2 + 0.1 * x - 0.05 * y,
         "Ni0": 1 + x + 0.1 * y,
     }
@@ -112,7 +113,9 @@ def test_values(recast):
     assert np.array_equal(grid["ShiftAngle"], np.zeros(len(xs)))
     assert np.array_equal(grid["d2x"][:, 0], np.zeros(len(xs)))
     assert np.array_equal(grid["Ni0"][:, 0], variables["Ni0"][xs, ys])
-    for name in ("forward", "backward"):
+    g_22 = variables["g_22"]
+    jxz = variables["J"] / np.sqrt(g_22)
+    for name, face in (("forward", "yhigh"), ("backward", "ylow")):
         nxt = grid[f"pmap_{name}_x"][:, 0].astype(int)
         at_target = nxt == len(xs)
         nxt = np.where(at_target, np.arange(len(xs)), nxt)
@@ -120,6 +123,14 @@ def test_values(recast):
             # The metric at the neighbour, the cell's own at a target
             there = variables[component][xs[nxt], ys[nxt]]
             assert np.array_equal(grid[f"{name}_{component}"][:, 0], there), component
+        # The y faces of the field-aligned mesh: g_22 from the mean of
+        # sqrt(g_22), and the area (here per dx dz) that BOUT++ takes from By
+        # on FCI-like meshes equal to the mean of J / sqrt(g_22)
+        root = 0.5 * (np.sqrt(g_22[xs, ys]) + np.sqrt(g_22[xs[nxt], ys[nxt]]))
+        assert np.allclose(grid[f"g_22_cell_{face}"][:, 0], root**2, rtol=1e-14, atol=0)
+        area = grid["By"][:, 0] / grid[f"By_cell_{face}"][:, 0] * jxz[xs, ys]
+        mean = 0.5 * (jxz[xs, ys] + jxz[xs[nxt], ys[nxt]])
+        assert np.allclose(area, mean, rtol=1e-14, atol=0), face
 
 
 def test_order_does_not_matter(tmp_path):
